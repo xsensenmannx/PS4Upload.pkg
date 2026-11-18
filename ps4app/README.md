@@ -105,7 +105,7 @@ ausschliesslich auf der PS4.
 Die Seite hat eine Update-Karte. `Release pruefen` fragt die GitHub-API
 (`releases/latest`) ab und vergleicht den Tag mit der Version aus `/status`:
 
-- neuer → `Update 0.5.2 verfuegbar`, Buttons `PKG laden` und `Datei waehlen`
+- neuer → `Update 0.5.3 verfuegbar`, Buttons `PKG laden` und `Datei waehlen`
 - gleich → `Bereits aktuell`
 - aelter → Hinweis, dass die installierte Version neuer ist
 
