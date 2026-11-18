@@ -1,0 +1,1154 @@
+#!/usr/bin/env python3
+"""PS4Upload - send .pkg files from a computer to a jailbroken PS4.
+
+The console pulls the package from this app over HTTP (Range requests are
+supported, which the PS4 installer needs) and installs it through the
+Remote Package Installer API on port 12800.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import socket
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+APP_NAME = "PS4Upload"
+VERSION = "0.1.0"
+PKG_MAGIC = b"\x7fCNT"
+RPI_PORT = 12800
+CHUNK = 256 * 1024
+
+TITLE_ID_RE = re.compile(r"(CUSA\d{5}|PPSA\d{5})", re.IGNORECASE)
+SPLIT_RE = re.compile(r"^(?P<base>.+?)_(?P<idx>\d{1,4})\.pkg$", re.IGNORECASE)
+SPLIT_DOT_RE = re.compile(r"^(?P<base>.+?)\.pkg\.(?P<idx>\d{1,4})$", re.IGNORECASE)
+HEX_RE = re.compile(r"(?<![\w\"'])0x([0-9a-fA-F]+)")
+
+ERROR_HINTS = {
+    0x80990033: "Die PS4 konnte die PKG-URL nicht laden. PC-IP, Port und Firewall pruefen.",
+}
+
+
+# --------------------------------------------------------------------------- utils
+
+
+def lan_ip() -> str:
+    """Best local address a console on the same network can reach."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def human_size(n: int) -> str:
+    if n <= 0:
+        return "0 B"
+    units = ("B", "KB", "MB", "GB", "TB")
+    value = float(n)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{n} B"
+
+
+def loads_lenient(text: str) -> dict:
+    """RPI answers with bare hex numbers (0x...) which are not valid JSON."""
+    cleaned = HEX_RE.sub(lambda m: str(int(m.group(1), 16)), text)
+    try:
+        value = json.loads(cleaned)
+    except ValueError:
+        return {"status": "fail", "error": f"Unerwartete Antwort: {text[:200]}"}
+    return value if isinstance(value, dict) else {"status": "fail", "error": "Unerwartete Antwort"}
+
+
+def as_int(value, default: int = 0) -> int:
+    try:
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        text = str(value).strip()
+        if text.lower().startswith("0x"):
+            return int(text, 16)
+        return int(float(text))
+    except (TypeError, ValueError):
+        return default
+
+
+def is_pkg_file(path: Path) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) == PKG_MAGIC
+    except OSError:
+        return False
+
+
+def split_info(path: Path):
+    for pattern in (SPLIT_RE, SPLIT_DOT_RE):
+        m = pattern.match(path.name)
+        if m:
+            return m.group("base").lower(), int(m.group("idx"))
+    return None
+
+
+def group_files(files: list[Path]) -> list[list[Path]]:
+    """Group split packages (_0.pkg, _1.pkg, ...) into one job."""
+    buckets: dict[str, dict[int, Path]] = {}
+    order: list[str] = []
+    for path in files:
+        info = split_info(path)
+        key = info[0] if info else f"file:{path}"
+        if key not in buckets:
+            buckets[key] = {}
+            order.append(key)
+        buckets[key][info[1] if info else 0] = path
+
+    groups: list[list[Path]] = []
+    for key in order:
+        parts = buckets[key]
+        indexes = sorted(parts)
+        if len(indexes) > 1 and indexes == list(range(len(indexes))):
+            groups.append([parts[i] for i in indexes])
+        else:
+            groups.extend([[parts[i]] for i in indexes])
+    return groups
+
+
+def job_name(files: list[Path]) -> str:
+    if len(files) == 1:
+        return files[0].stem
+    info = split_info(files[0])
+    if info:
+        for suffix in (f"_{info[1]}.pkg", f".pkg.{info[1]}"):
+            if files[0].name.lower().endswith(suffix.lower()):
+                return files[0].name[: -len(suffix)]
+    return files[0].stem + f" (+{len(files) - 1} Teile)"
+
+
+def title_id_of(files: list[Path]) -> str:
+    for path in files:
+        m = TITLE_ID_RE.search(path.name)
+        if m:
+            return m.group(1).upper()
+    return ""
+
+
+def parse_range(header: str | None, size: int):
+    """Return (start, end) inclusive, None for the whole file, or 'invalid'."""
+    if not header:
+        return None
+    m = re.match(r"^bytes=(\d*)-(\d*)$", header.strip())
+    if not m:
+        return None
+    first, last = m.group(1), m.group(2)
+    if not first and not last:
+        return None
+    if size <= 0:
+        return "invalid"
+    if not first:
+        length = int(last)
+        if length <= 0:
+            return "invalid"
+        start = max(0, size - length)
+        end = size - 1
+    else:
+        start = int(first)
+        end = int(last) if last else size - 1
+    if start >= size or start > end:
+        return "invalid"
+    return start, min(end, size - 1)
+
+
+# ----------------------------------------------------------------------------- app
+
+
+@dataclass
+class Job:
+    id: int
+    files: list[Path]
+    name: str
+    title_id: str
+    size: int
+    state: str = "queued"
+    task_id: int | None = None
+    transferred: int = 0
+    total: int = 0
+    percent: float = 0.0
+    speed: float = 0.0
+    rest_sec: int = 0
+    message: str = ""
+    error: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "title_id": self.title_id,
+            "files": [p.name for p in self.files],
+            "parts": len(self.files),
+            "size": self.size,
+            "state": self.state,
+            "task_id": self.task_id,
+            "transferred": self.transferred,
+            "total": self.total,
+            "percent": round(self.percent, 1),
+            "speed": round(self.speed, 1),
+            "rest_sec": self.rest_sec,
+            "message": self.message,
+            "error": self.error,
+        }
+
+    def reset_progress(self) -> None:
+        self.task_id = None
+        self.transferred = 0
+        self.total = 0
+        self.percent = 0.0
+        self.speed = 0.0
+        self.rest_sec = 0
+        self.message = ""
+        self.error = ""
+        self.state = "queued"
+
+
+class App:
+    def __init__(self, host_ip: str, port: int, console_ip: str, console_port: int):
+        self.host_ip = host_ip
+        self.port = port
+        self.console_ip = console_ip
+        self.console_port = console_port
+        self.lock = threading.RLock()
+        self.jobs: dict[int, Job] = {}
+        self.next_id = 1
+        self.logs: list[str] = []
+        self.stop_events: dict[int, threading.Event] = {}
+        self.worker_running = False
+        self.active_id: int | None = None
+        self._probe: dict | None = None
+        self._probe_at = 0.0
+
+    # -- logging ---------------------------------------------------------
+
+    def log(self, message: str) -> None:
+        line = f"[{time.strftime('%H:%M:%S')}] {message}"
+        with self.lock:
+            self.logs.append(line)
+            del self.logs[:-400]
+        print(line, flush=True)
+
+    # -- console ---------------------------------------------------------
+
+    def _tcp_reachable(self, host: str, port: int, timeout: float = 0.5) -> bool:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    def console_info(self) -> dict:
+        now = time.time()
+        if self._probe and now - self._probe_at < 3.0:
+            return self._probe
+
+        ip = self.console_ip.strip()
+        info = {"ip": ip, "port": self.console_port, "reachable": False, "api": None}
+        if ip:
+            info["reachable"] = self._tcp_reachable(ip, self.console_port)
+            if info["reachable"]:
+                info["api"] = "legacy"
+                try:
+                    url = f"http://{ip}:{self.console_port}/api/v2/system"
+                    with urllib.request.urlopen(url, timeout=0.7) as resp:
+                        if resp.status == 200:
+                            info["api"] = "v2"
+                except (urllib.error.URLError, OSError, ValueError):
+                    pass
+        self._probe = info
+        self._probe_at = now
+        return info
+
+    def set_console(self, ip: str) -> None:
+        ip = ip.strip()
+        if ip.lower().startswith("http://"):
+            ip = ip[7:]
+        elif ip.lower().startswith("https://"):
+            ip = ip[8:]
+        ip = ip.rstrip("/")
+        self.console_ip = ip
+        self._probe = None
+        self._probe_at = 0.0
+        self.log(f"PS4-Adresse: {ip or '(leer)'}")
+
+    def ps4_post(self, path: str, payload: dict, timeout: float = 15.0) -> dict:
+        if not self.console_ip:
+            return {"status": "fail", "error": "Keine PS4-IP eingetragen."}
+        url = f"http://{self.console_ip}:{self.console_port}{path}"
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json", "Connection": "close"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as resp:
+                return loads_lenient(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")
+            result = loads_lenient(body) if body.strip() else {}
+            result.setdefault("status", "fail")
+            result.setdefault("error", f"HTTP {exc.code}")
+            return result
+        except (urllib.error.URLError, OSError) as exc:
+            reason = getattr(exc, "reason", exc)
+            return {"status": "fail", "error": f"PS4 nicht erreichbar ({reason})"}
+
+    # -- jobs ------------------------------------------------------------
+
+    def add_path(self, raw: str) -> tuple[list[Job], int]:
+        raw = raw.strip().strip('"').strip("'")
+        if not raw:
+            raise ValueError("Bitte einen Pfad angeben.")
+        path = Path(os.path.expanduser(raw))
+        try:
+            path = path.resolve()
+        except OSError:
+            pass
+        if not path.exists():
+            raise ValueError(f"Pfad nicht gefunden: {path}")
+        if path.is_dir():
+            files = sorted(
+                f for f in path.iterdir() if f.is_file() and f.suffix.lower() == ".pkg"
+            )
+            if not files:
+                raise ValueError(f"Keine .pkg-Dateien in {path}")
+        else:
+            files = [path]
+
+        for file in files:
+            if file.suffix.lower() != ".pkg":
+                raise ValueError(f"Keine .pkg-Datei: {file.name}")
+            if not is_pkg_file(file):
+                raise ValueError(f"{file.name} ist keine PS4-PKG (Header 7f434e54 fehlt).")
+
+        added: list[Job] = []
+        skipped = 0
+        with self.lock:
+            known = {
+                tuple(j.files)
+                for j in self.jobs.values()
+                if j.state not in ("error", "stopped")
+            }
+            for group in group_files(files):
+                key = tuple(group)
+                if key in known:
+                    skipped += 1
+                    continue
+                job = Job(
+                    id=self.next_id,
+                    files=group,
+                    name=job_name(group),
+                    title_id=title_id_of(group),
+                    size=sum(p.stat().st_size for p in group),
+                )
+                self.jobs[job.id] = job
+                self.next_id += 1
+                known.add(key)
+                added.append(job)
+                self.log(
+                    f"Hinzugefuegt: {job.name} ({human_size(job.size)}"
+                    + (f", {len(group)} Teile" if len(group) > 1 else "")
+                    + ")"
+                )
+        if not added and not skipped:
+            raise ValueError("Nichts hinzugefuegt.")
+        return added, skipped
+
+    def job(self, job_id: int) -> Job | None:
+        with self.lock:
+            return self.jobs.get(job_id)
+
+    def start_job(self, job: Job) -> None:
+        with self.lock:
+            if job.state not in ("queued", "error", "stopped"):
+                raise ValueError("Dieser Auftrag laeuft bereits.")
+            job.reset_progress()
+        with self.lock:
+            if not self.worker_running:
+                self.worker_running = True
+                threading.Thread(target=self._worker, name="ps4upload-worker", daemon=True).start()
+        self.log(f"Eingereiht: {job.name}")
+
+    def stop_job(self, job: Job) -> None:
+        with self.lock:
+            event = self.stop_events.get(job.id)
+            if event is not None:
+                event.set()
+                self.log(f"Stoppe: {job.name}")
+                return
+            if job.state == "queued":
+                job.state = "stopped"
+                job.message = "Gestoppt"
+                job.percent = 0.0
+                self.log(f"Gestoppt: {job.name}")
+                return
+            if job.state == "installing" and job.task_id:
+                threading.Thread(
+                    target=self._stop_task, args=(job,), name="ps4upload-stop", daemon=True
+                ).start()
+
+    def _stop_task(self, job: Job) -> None:
+        result = self.ps4_post("/api/stop_task", {"task_id": job.task_id}, timeout=8.0)
+        if result.get("status") == "success":
+            job.state = "stopped"
+            job.message = "Installation auf der PS4 gestoppt"
+            self.log(f"Task {job.task_id} gestoppt: {job.name}")
+        else:
+            self.log(f"Stoppen fehlgeschlagen: {result.get('error') or result}")
+
+    def remove_job(self, job: Job) -> None:
+        with self.lock:
+            if job.state in ("sending", "transferring", "installing"):
+                raise ValueError("Auftrag laeuft noch - bitte zuerst stoppen.")
+            self.jobs.pop(job.id, None)
+        self.log(f"Entfernt: {job.name}")
+
+    def _worker(self) -> None:
+        try:
+            while True:
+                with self.lock:
+                    job = next((j for j in self.jobs.values() if j.state == "queued"), None)
+                    if job is None:
+                        return
+                    self.active_id = job.id
+                self._run(job)
+        finally:
+            with self.lock:
+                self.worker_running = False
+                self.active_id = None
+
+    def _pkg_url(self, job: Job, index: int) -> str:
+        name = urllib.parse.quote(job.files[index].name)
+        return f"http://{self.host_ip}:{self.port}/pkg/{job.id}/{index}/{name}"
+
+    def _fail(self, job: Job, message: str) -> None:
+        job.state = "error"
+        job.error = message
+        job.message = message
+        job.speed = 0.0
+        self.log(f"Fehler bei {job.name}: {message}")
+
+    def _run(self, job: Job) -> None:
+        stop = threading.Event()
+        with self.lock:
+            self.stop_events[job.id] = stop
+        try:
+            if not self.console_ip:
+                self._fail(job, "Keine PS4-IP eingetragen.")
+                return
+
+            job.state = "sending"
+            job.message = "Installationsauftrag wird an die PS4 gesendet ..."
+            urls = [self._pkg_url(job, i) for i in range(len(job.files))]
+            self.log(f"Sende Installationsauftrag fuer {job.name} an {self.console_ip}")
+            result = self.ps4_post("/api/install", {"type": "direct", "packages": urls}, timeout=20.0)
+
+            if result.get("status") != "success":
+                code = result.get("error_code")
+                if code is not None:
+                    value = as_int(code)
+                    hint = ERROR_HINTS.get(value)
+                    message = f"PS4-Fehler 0x{value:08X}"
+                    if hint:
+                        message += f" - {hint}"
+                else:
+                    message = str(result.get("error") or "Die PS4 hat den Auftrag abgelehnt.")
+                self._fail(job, message)
+                return
+
+            task_id = as_int(result.get("task_id"), -2)
+            if task_id == -1:
+                job.state = "done"
+                job.percent = 100.0
+                job.message = "War auf der PS4 bereits installiert."
+                self.log(f"{job.name} ist bereits installiert.")
+                return
+            if task_id < 0:
+                self._fail(job, "Die PS4 hat keine Task-ID zurueckgegeben.")
+                return
+
+            job.task_id = task_id
+            if result.get("title"):
+                job.name = str(result["title"])
+            job.state = "transferring"
+            job.message = "PS4 laedt die PKG ..."
+            self.log(f"Task {task_id} gestartet: {job.name}")
+
+            last_bytes = 0
+            last_time = time.time()
+            misses = 0
+
+            while not stop.is_set():
+                progress = self.ps4_post(
+                    "/api/get_task_progress", {"task_id": task_id}, timeout=10.0
+                )
+                if progress.get("status") != "success":
+                    misses += 1
+                    if misses >= 3:
+                        job.state = "installing"
+                        job.percent = 100.0 if job.total and job.transferred >= job.total else job.percent
+                        job.message = "Kein Fortschritt abrufbar - die PS4 installiert im Hintergrund."
+                        self.log(f"Kein Fortschritt fuer Task {task_id}; Installation laeuft weiter.")
+                        return
+                    time.sleep(1.0)
+                    continue
+                misses = 0
+
+                error = as_int(progress.get("error"))
+                if error:
+                    hint = ERROR_HINTS.get(error)
+                    message = f"PS4-Fehler 0x{error:08X}"
+                    if hint:
+                        message += f" - {hint}"
+                    self._fail(job, message)
+                    return
+
+                total = as_int(progress.get("length_total"))
+                done = as_int(progress.get("transferred_total"))
+                if total > 0:
+                    job.total = total
+                    job.transferred = max(0, min(done, total))
+                    job.percent = job.transferred * 100.0 / total
+
+                now = time.time()
+                if now - last_time >= 0.5:
+                    delta = max(0, done - last_bytes)
+                    instant = delta / (now - last_time)
+                    job.speed = instant if job.speed <= 0 else job.speed * 0.6 + instant * 0.4
+                    last_bytes = done
+                    last_time = now
+                job.rest_sec = max(0, as_int(progress.get("rest_sec_total")))
+
+                if job.total > 0 and job.transferred >= job.total:
+                    job.state = "installing"
+                    job.percent = 100.0
+                    job.speed = 0.0
+                    job.rest_sec = 0
+                    job.message = "Download fertig - die PS4 installiert jetzt."
+                    self.log(f"Download fertig: {job.name}; PS4 installiert.")
+                    return
+
+                time.sleep(1.0)
+
+            self.ps4_post("/api/stop_task", {"task_id": task_id}, timeout=8.0)
+            job.state = "stopped"
+            job.message = "Gestoppt"
+            job.speed = 0.0
+            self.log(f"Task {task_id} gestoppt: {job.name}")
+        except Exception as exc:  # keep the worker alive
+            self._fail(job, f"Unerwarteter Fehler: {exc}")
+        finally:
+            with self.lock:
+                self.stop_events.pop(job.id, None)
+
+    # -- state -----------------------------------------------------------
+
+    def state(self) -> dict:
+        with self.lock:
+            jobs = [self.jobs[i].to_dict() for i in sorted(self.jobs)]
+            logs = list(self.logs[-80:])
+            active = self.active_id
+        return {
+            "version": VERSION,
+            "server": {
+                "url": f"http://{self.host_ip}:{self.port}",
+                "ip": self.host_ip,
+                "port": self.port,
+            },
+            "console": self.console_info(),
+            "active": active,
+            "jobs": jobs,
+            "logs": logs,
+        }
+
+
+# --------------------------------------------------------------------------- http
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = f"PS4Upload/{VERSION}"
+
+    @property
+    def app(self) -> App:
+        return self.server.app  # type: ignore[attr-defined]
+
+    def log_message(self, fmt, *args) -> None:  # noqa: A003 - stdlib signature
+        pass
+
+    # -- responses -------------------------------------------------------
+
+    def _send_bytes(self, body: bytes, content_type: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _send_json(self, obj: dict, status: int = 200) -> None:
+        self._send_bytes(
+            json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+            "application/json; charset=utf-8",
+            status,
+        )
+
+    def _send_error_json(self, message: str, status: int) -> None:
+        self._send_json({"error": message}, status)
+
+    # -- parsing ---------------------------------------------------------
+
+    def _read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return {}
+        if length > 2_000_000:
+            return None
+        raw = self.rfile.read(length)
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        return body if isinstance(body, dict) else {}
+
+    # -- routes ----------------------------------------------------------
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib naming
+        try:
+            path = urllib.parse.urlsplit(self.path).path
+            if path == "/":
+                self._send_bytes(PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            elif path == "/api/state":
+                self._send_json(self.app.state())
+            elif path.startswith("/pkg/"):
+                self._serve_file(path)
+            elif path == "/favicon.ico":
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self._send_error_json("Nicht gefunden", 404)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:  # pragma: no cover - defensive
+            try:
+                self._send_error_json(f"Fehler: {exc}", 500)
+            except OSError:
+                pass
+
+    def do_HEAD(self) -> None:  # noqa: N802 - stdlib naming
+        self.do_GET()
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib naming
+        try:
+            path = urllib.parse.urlsplit(self.path).path
+            body = self._read_json()
+            if body is None:
+                self._send_error_json("Ungueltiges JSON", 400)
+                return
+
+            if path == "/api/ps4":
+                ip = str(body.get("ip") or "").strip()
+                self.app.set_console(ip)
+                self._send_json({"ok": True, "console": self.app.console_info()})
+                return
+
+            if path == "/api/add":
+                try:
+                    added, skipped = self.app.add_path(str(body.get("path") or ""))
+                except ValueError as exc:
+                    self._send_error_json(str(exc), 400)
+                    return
+                message = f"{len(added)} Auftrag/Auftraege hinzugefuegt"
+                if skipped:
+                    message += f", {skipped} bereits vorhanden"
+                self._send_json(
+                    {"ok": True, "added": [j.to_dict() for j in added], "message": message}
+                )
+                return
+
+            job_id = as_int(body.get("id"), -1)
+            job = self.app.job(job_id)
+            if job is None:
+                self._send_error_json("Auftrag nicht gefunden", 404)
+                return
+
+            if path == "/api/install":
+                try:
+                    self.app.start_job(job)
+                except ValueError as exc:
+                    self._send_error_json(str(exc), 400)
+                    return
+                self._send_json({"ok": True})
+                return
+
+            if path == "/api/stop":
+                self.app.stop_job(job)
+                self._send_json({"ok": True})
+                return
+
+            if path == "/api/remove":
+                try:
+                    self.app.remove_job(job)
+                except ValueError as exc:
+                    self._send_error_json(str(exc), 400)
+                    return
+                self._send_json({"ok": True})
+                return
+
+            self._send_error_json("Nicht gefunden", 404)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:  # pragma: no cover - defensive
+            try:
+                self._send_error_json(f"Fehler: {exc}", 500)
+            except OSError:
+                pass
+
+    def _serve_file(self, path: str) -> None:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            self._send_error_json("Nicht gefunden", 404)
+            return
+        _, raw_id, raw_index, raw_name = parts
+        job = self.app.job(as_int(raw_id, -1))
+        index = as_int(raw_index, -1)
+        if job is None or index < 0 or index >= len(job.files):
+            self._send_error_json("Paket nicht gefunden", 404)
+            return
+        file = job.files[index]
+        try:
+            size = file.stat().st_size
+            handle = open(file, "rb")
+        except OSError:
+            self._send_error_json("Datei nicht lesbar", 404)
+            return
+
+        with handle:
+            requested = parse_range(self.headers.get("Range"), size)
+            if requested == "invalid":
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+
+            start, end = requested or (0, max(0, size - 1))
+            length = 0 if size == 0 else end - start + 1
+            self.send_response(206 if requested else 200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(length))
+            if requested:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+
+            if self.command == "HEAD" or length == 0:
+                return
+            handle.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = handle.read(min(CHUNK, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+
+
+PAGE = r"""<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PS4Upload</title>
+<style>
+:root{
+  --bg:#0b0f15; --card:#121a24; --card2:#0f1620; --line:#22303f; --text:#e8eef7;
+  --muted:#8fa0b5; --accent:#4d9dff; --ok:#3ddc84; --bad:#ff5f5f; --warn:#ffb020;
+}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;}
+body{
+  font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,Ubuntu,sans-serif;
+  color:var(--text);
+  background:
+    radial-gradient(900px 480px at 12% -10%, #16314d 0%, transparent 65%),
+    radial-gradient(700px 400px at 100% 0%, #1a2436 0%, transparent 60%),
+    var(--bg);
+}
+header{
+  max-width:980px;margin:0 auto;padding:28px 20px 8px;
+  display:flex;align-items:center;justify-content:space-between;gap:16px;
+}
+.brand{display:flex;align-items:center;gap:14px}
+.logo{
+  width:46px;height:46px;border-radius:12px;display:grid;place-items:center;
+  font:700 12px/1 ui-monospace,monospace;letter-spacing:.5px;color:#04121f;
+  background:linear-gradient(145deg,#7cc0ff,#3b8ff0);
+  box-shadow:0 6px 24px rgba(61,140,255,.35);
+}
+h1{font-size:22px;margin:0;letter-spacing:.2px}
+h2{font-size:15px;margin:0;letter-spacing:.3px;text-transform:uppercase;color:#c7d5e6}
+.muted{color:var(--muted)}
+.small{font-size:12.5px}
+.ver{font:12px ui-monospace,monospace;color:var(--muted);border:1px solid var(--line);padding:4px 9px;border-radius:999px}
+main{max-width:980px;margin:0 auto;padding:10px 20px 60px;display:grid;gap:16px}
+.card{background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--line);border-radius:16px;padding:16px 18px}
+.card-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+.row{display:flex;gap:10px}
+input{
+  flex:1;min-width:0;background:#0a1119;border:1px solid var(--line);color:var(--text);
+  border-radius:10px;padding:11px 13px;font:14px/1.4 ui-monospace,monospace;outline:none;
+}
+input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(77,157,255,.15)}
+button{
+  background:#1b2836;color:var(--text);border:1px solid var(--line);border-radius:10px;
+  padding:10px 15px;font:600 14px/1.2 inherit;cursor:pointer;white-space:nowrap;
+}
+button:hover{background:#233447}
+button.primary{background:linear-gradient(160deg,#5aa8ff,#2f7fe0);border-color:#2f7fe0;color:#03111f}
+button.primary:hover{filter:brightness(1.07)}
+button.ghost{background:transparent}
+button.small{padding:6px 10px;font-size:12.5px}
+button:disabled{opacity:.45;cursor:not-allowed}
+.dot{width:10px;height:10px;border-radius:50%;background:#3a4656;box-shadow:0 0 0 4px rgba(255,255,255,.03)}
+.dot.ok{background:var(--ok);box-shadow:0 0 12px rgba(61,220,132,.6)}
+.dot.bad{background:var(--bad);box-shadow:0 0 12px rgba(255,95,95,.5)}
+#jobs{display:grid;gap:10px;margin-top:14px}
+.job{background:#0c141d;border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.job-top{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.job-name{font-weight:600;overflow-wrap:anywhere}
+.job-sub{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:4px;color:var(--muted);font-size:12.5px}
+.pill{font:11px ui-monospace,monospace;border:1px solid var(--line);border-radius:999px;padding:2px 8px;color:#a9bdd4}
+.pill.queued{color:#a9bdd4}
+.pill.sending,.pill.transferring{color:var(--accent);border-color:rgba(77,157,255,.45)}
+.pill.installing{color:var(--warn);border-color:rgba(255,176,32,.45)}
+.pill.done{color:var(--ok);border-color:rgba(61,220,132,.45)}
+.pill.error{color:var(--bad);border-color:rgba(255,95,95,.45)}
+.pill.stopped{color:#c2a6ff;border-color:rgba(194,166,255,.4)}
+.bar{height:7px;background:#0a1018;border:1px solid var(--line);border-radius:999px;overflow:hidden;margin:10px 0 6px}
+.bar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#3b8ff0,#6fc0ff);border-radius:999px;transition:width .4s ease}
+.job-foot{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+.job-actions{display:flex;gap:8px;flex-wrap:wrap}
+.msg{font-size:12.5px;color:var(--muted)}
+.msg.error{color:#ff9c9c}
+pre#log{
+  margin:0;max-height:240px;overflow:auto;background:#080d13;border:1px solid var(--line);
+  border-radius:10px;padding:12px;font:12px/1.6 ui-monospace,monospace;color:#9fb3c9;white-space:pre-wrap;
+}
+.empty{padding:18px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:12px}
+#toast{
+  position:fixed;left:50%;bottom:22px;transform:translate(-50%,20px);opacity:0;pointer-events:none;
+  background:#17222f;border:1px solid var(--line);color:var(--text);padding:10px 16px;border-radius:10px;
+  font-size:13.5px;transition:.25s;max-width:min(90vw,560px);box-shadow:0 10px 30px rgba(0,0,0,.45);
+}
+#toast.show{opacity:1;transform:translate(-50%,0)}
+@media (max-width:560px){
+  header{padding-top:20px}
+  .row{flex-direction:column}
+  button{width:100%}
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="logo">PKG</div>
+    <div>
+      <h1>PS4Upload</h1>
+      <div class="muted small">Pakete vom PC auf die PS4 schicken</div>
+    </div>
+  </div>
+  <span class="ver">v{{VERSION}}</span>
+</header>
+<main>
+  <section class="card">
+    <div class="card-head"><h2>PS4</h2><span id="dot" class="dot"></span></div>
+    <form id="connectForm" class="row">
+      <input id="ipInput" placeholder="192.168.0.50" inputmode="decimal" spellcheck="false" autocomplete="off">
+      <button class="primary" type="submit">Verbinden</button>
+    </form>
+    <p id="consoleText" class="muted small" style="margin:10px 0 0">Remote Package Installer auf der PS4 starten, dann die IP eintragen.</p>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Warteschlange</h2>
+      <span id="serverUrl" class="muted small"></span>
+    </div>
+    <form id="addForm" class="row">
+      <input id="pathInput" placeholder="D:\Spiele\spiel.pkg oder Ordner" spellcheck="false" autocomplete="off">
+      <button type="submit">Hinzufuegen</button>
+    </form>
+    <p class="muted small" style="margin:10px 0 0">
+      Pfad auf diesem PC. Ordner werden nach .pkg durchsucht; geteilte Pakete (_0, _1, ...) werden zusammengefasst.
+    </p>
+    <div id="jobs"><div class="empty">Noch keine PKG hinzugefuegt.</div></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Protokoll</h2>
+      <button id="clearLog" class="ghost small" type="button">Leeren</button>
+    </div>
+    <pre id="log"></pre>
+  </section>
+</main>
+<div id="toast"></div>
+<script>
+const LABELS = {queued:"Wartet", sending:"Wird gesendet", transferring:"Uebertragung", installing:"Installation", done:"Fertig", error:"Fehler", stopped:"Gestoppt"};
+const ACTIVE = ["sending","transferring","installing"];
+let lastLog = "";
+let toastTimer = null;
+
+const $ = (sel) => document.querySelector(sel);
+
+function fmtBytes(n){
+  n = Number(n) || 0;
+  if (n < 1024) return n + " B";
+  const units = ["KB","MB","GB","TB"];
+  let value = n / 1024, i = 0;
+  while (value >= 1024 && i < units.length - 1){ value /= 1024; i++; }
+  return value.toFixed(value >= 100 ? 0 : 1) + " " + units[i];
+}
+function fmtSpeed(bps){
+  if (!bps || bps < 1) return "";
+  return fmtBytes(bps) + "/s";
+}
+function fmtEta(sec){
+  sec = Math.max(0, Math.round(sec));
+  if (sec < 60) return sec + " s";
+  const m = Math.floor(sec / 60), s = sec % 60;
+  if (m < 60) return m + " min " + s + " s";
+  const h = Math.floor(m / 60);
+  return h + " h " + (m % 60) + " min";
+}
+function esc(text){
+  return String(text).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+function toast(message){
+  const el = $("#toast");
+  el.textContent = message;
+  el.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 4200);
+}
+
+async function api(path, body){
+  const options = body ? {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)} : undefined;
+  const response = await fetch(path, options);
+  let data = {};
+  try { data = await response.json(); } catch (e) { data = {}; }
+  if (!response.ok) throw new Error(data.error || ("HTTP " + response.status));
+  return data;
+}
+
+function jobCard(job){
+  const pct = job.state === "done" ? 100 : Math.max(0, Math.min(100, job.percent || 0));
+  const label = LABELS[job.state] || job.state;
+  let detail = fmtBytes(job.size);
+  if (job.parts > 1) detail += " · " + job.parts + " Teile";
+  if (job.title_id) detail += " · " + job.title_id;
+  if (job.state === "transferring" || job.state === "installing" || job.state === "done"){
+    const moved = fmtBytes(job.transferred) + " / " + fmtBytes(job.total || job.size);
+    const speed = job.state === "transferring" && job.speed ? " · " + fmtSpeed(job.speed) : "";
+    const eta = job.state === "transferring" && job.rest_sec ? " · noch " + fmtEta(job.rest_sec) : "";
+    detail += " · " + moved + speed + eta;
+  }
+  const message = job.message || job.error || "";
+  const msgClass = job.state === "error" ? "msg error" : "msg";
+
+  let actions = "";
+  if (job.state === "queued" || job.state === "error" || job.state === "stopped"){
+    const text = job.state === "queued" ? "Installieren" : "Erneut versuchen";
+    actions += '<button class="primary small" data-act="install" data-id="' + job.id + '">' + text + '</button>';
+  }
+  if (ACTIVE.includes(job.state)){
+    actions += '<button class="small" data-act="stop" data-id="' + job.id + '">Stoppen</button>';
+  }
+  if (!ACTIVE.includes(job.state)){
+    actions += '<button class="ghost small" data-act="remove" data-id="' + job.id + '">Entfernen</button>';
+  }
+
+  return '<div class="job">'
+    + '<div class="job-top"><div class="job-name">' + esc(job.name) + '</div>'
+    + '<span class="pill ' + job.state + '">' + label + '</span></div>'
+    + '<div class="job-sub">' + esc(detail) + '</div>'
+    + '<div class="bar"><i style="width:' + pct.toFixed(1) + '%"></i></div>'
+    + '<div class="job-foot"><div class="' + msgClass + '">' + esc(message) + '</div>'
+    + '<div class="job-actions">' + actions + '</div></div>'
+    + '</div>';
+}
+
+function render(state){
+  const dot = $("#dot");
+  const text = $("#consoleText");
+  const consoleInfo = state.console || {};
+  dot.className = "dot " + (consoleInfo.reachable ? "ok" : "bad");
+  if (!consoleInfo.ip){
+    text.textContent = "Remote Package Installer auf der PS4 starten, dann die IP eintragen.";
+  } else if (consoleInfo.reachable){
+    const api = consoleInfo.api === "v2" ? " · API v2" : "";
+    text.textContent = "Verbunden mit " + consoleInfo.ip + ":" + consoleInfo.port + api + " - bereit.";
+  } else {
+    text.textContent = "Keine Verbindung zu " + consoleInfo.ip + ":" + consoleInfo.port + " - laeuft der Remote Package Installer?";
+  }
+
+  const ipInput = $("#ipInput");
+  if (document.activeElement !== ipInput) ipInput.value = consoleInfo.ip || "";
+
+  $("#serverUrl").textContent = (state.server && state.server.url) ? state.server.url : "";
+
+  const jobs = state.jobs || [];
+  $("#jobs").innerHTML = jobs.length
+    ? jobs.map(jobCard).join("")
+    : '<div class="empty">Noch keine PKG hinzugefuegt.</div>';
+
+  const log = (state.logs || []).join("\n");
+  if (log !== lastLog){
+    lastLog = log;
+    const pre = $("#log");
+    pre.textContent = log;
+    pre.scrollTop = pre.scrollHeight;
+  }
+}
+
+async function loop(){
+  try {
+    render(await api("/api/state"));
+  } catch (error) {
+    $("#dot").className = "dot bad";
+    $("#consoleText").textContent = "Server nicht erreichbar.";
+  }
+  setTimeout(loop, 1000);
+}
+
+$("#connectForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    await api("/api/ps4", {ip: $("#ipInput").value.trim()});
+    toast("PS4-Adresse gespeichert");
+  } catch (error){ toast(error.message); }
+});
+
+$("#addForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = $("#pathInput");
+  try {
+    const result = await api("/api/add", {path: input.value});
+    input.value = "";
+    toast(result.message || "Hinzugefuegt");
+  } catch (error){ toast(error.message); }
+});
+
+$("#jobs").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-act]");
+  if (!button) return;
+  try {
+    await api("/api/" + button.dataset.act, {id: Number(button.dataset.id)});
+  } catch (error){ toast(error.message); }
+});
+
+$("#clearLog").addEventListener("click", () => {
+  $("#log").textContent = "";
+  lastLog = "";
+});
+
+loop();
+</script>
+</body>
+</html>
+"""
+
+
+# --------------------------------------------------------------------------- main
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="ps4upload.py",
+        description="PKG-Dateien vom PC an eine jailbreakte PS4 senden und installieren.",
+    )
+    parser.add_argument("files", nargs="*", help="PKG-Dateien oder Ordner")
+    parser.add_argument("--port", type=int, default=9898, help="HTTP-Port fuer die PS4 (Standard: 9898)")
+    parser.add_argument("--host", default="0.0.0.0", help="Bind-Adresse (Standard: 0.0.0.0)")
+    parser.add_argument("--host-ip", default="", help="IP dieses PCs, wie die PS4 ihn sieht")
+    parser.add_argument("--console", default="", help="IP der PS4")
+    parser.add_argument("--console-port", type=int, default=RPI_PORT, help="RPI-Port der PS4 (Standard: 12800)")
+    parser.add_argument("--no-browser", action="store_true", help="Browser nicht automatisch oeffnen")
+    args = parser.parse_args(argv)
+
+    host_ip = args.host_ip.strip() or lan_ip()
+    app = App(host_ip=host_ip, port=args.port, console_ip=args.console.strip(), console_port=args.console_port)
+
+    try:
+        httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as exc:
+        print(f"Port {args.port} kann nicht belegt werden: {exc}")
+        print("Tipp: anderen Port mit --port waehlen.")
+        return 1
+    httpd.daemon_threads = True
+    httpd.app = app  # type: ignore[attr-defined]
+
+    for raw in args.files:
+        try:
+            added, _ = app.add_path(raw)
+            print(f"{len(added)} Auftrag/Auftraege aus {raw}")
+        except ValueError as exc:
+            print(f"Fehler: {exc}")
+
+    print()
+    print(f"{APP_NAME} {VERSION}")
+    print(f"Browser:  http://127.0.0.1:{args.port}")
+    print(f"Fuer PS4: http://{host_ip}:{args.port}")
+    print("Die PS4 muss diese Adresse im LAN erreichen koennen (Firewall!).")
+    if app.console_ip:
+        print(f"PS4:      {app.console_ip}:{app.console_port}")
+    else:
+        print("PS4:      IP im Browser eintragen")
+    print("Beenden mit Strg+C")
+    print()
+
+    if not args.no_browser:
+        threading.Timer(0.8, lambda: webbrowser.open(f"http://127.0.0.1:{args.port}")).start()
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nBeende ...")
+    finally:
+        httpd.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

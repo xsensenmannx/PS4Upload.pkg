@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log
+.tmp/
+upstream-ps5upload/
+.freebuff/
