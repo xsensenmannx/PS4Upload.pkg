@@ -32,6 +32,7 @@
 #include "pin.h"
 #include "pkg.h"
 #include "install.h"
+#include "version.h"
 #include "ui.h"
 
 #define FRAME_WIDTH UI_WIDTH
@@ -105,7 +106,8 @@ static struct
     unsigned long long length;
     unsigned long long received;
     unsigned long long started_ms;
-} g_conn = { -1, 0, { 0 }, 0, 0, { 0 }, { 0 }, 0, 0, 0 };
+    bool force;
+} g_conn = { -1, 0, { 0 }, 0, 0, { 0 }, { 0 }, 0, 0, 0, false };
 
 static UiInstallView g_install_view;
 
@@ -244,6 +246,20 @@ static void send_page(int fd, const char *client_ip)
         "<section style=\"margin-top:1.6rem;padding:1.1rem;border:1px solid #1d2b47;"
         "border-radius:.8rem;background:#101a2c\">"
         "<h2 style=\"font-size:.9rem;letter-spacing:.06em;color:#7f8fb0;margin:0 0 .8rem;"
+        "text-transform:uppercase\">Update</h2>"
+        "<p id=\"upd\" style=\"margin:0 0 .7rem;font-size:.9rem\">Installierte Version wird geladen ...</p>"
+        "<button id=\"check\" style=\"padding:.5rem 1rem;border:1px solid #2c4370;"
+        "border-radius:.5rem;background:#16233a;color:#e8eefc;font-weight:600\">Release pruefen</button>"
+        "<a id=\"dl\" target=\"_blank\" rel=\"noopener\" style=\"display:none;margin-left:.5rem;"
+        "padding:.5rem 1rem;border-radius:.5rem;background:#2360be;color:#fff;font-weight:600;"
+        "text-decoration:none\">PKG laden</a>"
+        "<button id=\"pick\" style=\"display:none;margin-left:.5rem;padding:.5rem 1rem;"
+        "border:1px solid #2c4370;border-radius:.5rem;background:#16233a;color:#e8eefc\">"
+        "Datei waehlen</button>"
+        "</section>"
+        "<section style=\"margin-top:1rem;padding:1.1rem;border:1px solid #1d2b47;"
+        "border-radius:.8rem;background:#101a2c\">"
+        "<h2 style=\"font-size:.9rem;letter-spacing:.06em;color:#7f8fb0;margin:0 0 .8rem;"
         "text-transform:uppercase\">PKG hochladen</h2>"
         "<input id=\"f\" type=\"file\" accept=\".pkg\" style=\"color:#a9b8d6\">"
         "<input id=\"pin\" inputmode=\"numeric\" maxlength=\"4\" placeholder=\"PIN vom TV\" "
@@ -264,20 +280,43 @@ static void send_page(int fd, const char *client_ip)
         "<script>"
         "var f=document.getElementById('f'),go=document.getElementById('go'),"
         "bar=document.getElementById('bar'),out=document.getElementById('out'),"
-        "inst=document.getElementById('inst'),pin=document.getElementById('pin'),timer=null;"
+        "inst=document.getElementById('inst'),pin=document.getElementById('pin'),timer=null,"
+        "upd=document.getElementById('upd'),dl=document.getElementById('dl'),"
+        "check=document.getElementById('check'),pick=document.getElementById('pick'),"
+        "installedVersion='',updDone=false;"
         "var names={idle:'Bereit',upload:'Upload',check:'Pruefung',register:'Registrierung',"
         "install:'Installation',done:'Fertig',failed:'Fehler'};"
         "function show(j){var t=names[j.phase]||j.phase;if(j.percent>=0){t+=' '+j.percent+' %';}"
         "if(j.title){t+=' - '+j.title;}if(j.error){t+=' ('+j.note+' 0x'+(j.error>>>0).toString(16)+')';}"
         "inst.textContent=t;}"
         "function poll(){fetch('/status',{cache:'no-store'}).then(function(r){return r.json();})"
-        ".then(function(j){show(j.install);}).catch(function(){});}"
+        ".then(function(j){show(j.install);"
+        "if(j.version&&!installedVersion){installedVersion=j.version;"
+        "if(!updDone){upd.textContent='Installiert: '+installedVersion;}}}).catch(function(){});}"
         "function startPoll(){if(timer){return;}timer=setInterval(poll,1000);}"
-        "go.onclick=function(){var file=f.files[0];"
+        "function cmpVersion(a,b){var x=a.split('.'),y=b.split('.');"
+        "for(var i=0;i<3;i++){var d=(parseInt(x[i],10)||0)-(parseInt(y[i],10)||0);if(d){return d;}}return 0;}"
+        "check.onclick=function(){updDone=true;check.disabled=true;upd.textContent='Pruefe Release ...';"
+        "fetch('https://api.github.com/repos/xsensenmannx/PS4Upload.pkg/releases/latest',{cache:'no-store'})"
+        ".then(function(r){if(!r.ok){throw 0;}return r.json();})"
+        ".then(function(rel){var tag=(rel.tag_name||'').replace(/^v/,'');"
+        "var asset=(rel.assets||[]).filter(function(a){return /\\.pkg$/i.test(a.name);})[0];"
+        "if(!asset){throw 0;}if(!installedVersion){"
+        "upd.textContent='Installierte Version unbekannt - Seite neu laden.';return;}"
+        "var c=cmpVersion(tag,installedVersion);"
+        "if(c>0){upd.textContent='Update '+tag+' verfuegbar (installiert '+installedVersion+').';"
+        "dl.href=asset.browser_download_url;dl.download=asset.name;"
+        "dl.style.display='inline-block';pick.style.display='inline-block';}"
+        "else if(c===0){upd.textContent='Bereits aktuell: '+installedVersion+'.';}"
+        "else{upd.textContent='Installiert ist neuer ('+installedVersion+') als der Release ('+tag+').';}})"
+        ".catch(function(){upd.textContent='Release-Abfrage fehlgeschlagen (Internet noetig).';})"
+        ".then(function(){check.disabled=false;});};"
+        "pick.onclick=function(){f.click();};"
+        "function sendUpload(force){var file=f.files[0];"
         "if(!/^[0-9]{4}$/.test(pin.value)){out.textContent='Bitte die 4-stellige PIN vom Fernseher eingeben.';return;}"
         "if(!file){out.textContent='Bitte eine PKG waehlen.';return;}"
         "var xhr=new XMLHttpRequest();xhr.open('POST','/upload?name='+encodeURIComponent(file.name)"
-        "+'&pin='+encodeURIComponent(pin.value));"
+        "+'&pin='+encodeURIComponent(pin.value)+(force?'&force=1':''));"
         "go.disabled=true;"
         "xhr.upload.onprogress=function(e){if(e.lengthComputable){"
         "bar.style.width=(e.loaded/e.total*100)+'%';"
@@ -285,10 +324,14 @@ static void send_page(int fd, const char *client_ip)
         "xhr.onload=function(){go.disabled=false;"
         "if(xhr.status===200){out.textContent='Empfangen. Installation laeuft.';}"
         "else if(xhr.status===403){out.textContent='PIN falsch oder gesperrt - Code steht am Fernseher.';pin.value='';}"
+        "else if(xhr.status===409){var msg='Gleiche oder aeltere Version.';"
+        "try{msg=JSON.parse(xhr.responseText).error||msg;}catch(e){}"
+        "out.textContent=msg;if(confirm(msg+'\\n\\nTrotzdem installieren?')){sendUpload(true);}}"
         "else{out.textContent='Fehler '+xhr.status;}"
         "poll();startPoll();};"
         "xhr.onerror=function(){go.disabled=false;out.textContent='Netzwerkfehler.';};"
-        "xhr.send(file);};"
+        "xhr.send(file);}"
+        "go.onclick=function(){sendUpload(false);};"
         "poll();"
         "</script>"
         "<p>Streaming, Spielsteuerung und Capture sind nicht Teil dieses Stands.</p>"
@@ -499,6 +542,7 @@ static void conn_close(void)
     g_conn.header[0] = 0;
     g_conn.length = 0;
     g_conn.received = 0;
+    g_conn.force = false;
 }
 
 static int header_prefix(const char *line, const char *name)
@@ -791,6 +835,43 @@ static void conn_finish_upload(void)
         return;
     }
 
+    {
+        int installed = pkg_version_value(APP_VER);
+        int package = pkg_version_value(info.app_ver);
+        bool not_newer = installed >= 0 && package >= 0 && package <= installed;
+
+        if (not_newer && !g_conn.force)
+        {
+            char message[128];
+            char note[64];
+            int used = 0;
+            int index = 0;
+
+            used = ui_append_text(message, sizeof(message), used, "Paket ");
+            used = ui_append_text(message, sizeof(message), used, info.app_ver);
+            used = ui_append_text(message, sizeof(message), used, " ist nicht neuer als installiert ");
+            used = ui_append_text(message, sizeof(message), used, APP_VER);
+            used = ui_append_text(message, sizeof(message), used, " - Installation abgebrochen");
+
+            index = ui_append_text(note, sizeof(note), index, "VERSION ");
+            index = ui_append_text(note, sizeof(note), index, info.app_ver);
+            index = ui_append_text(note, sizeof(note), index, " NICHT NEUER");
+
+            remove(g_conn.path);
+            install_mark_failed_note(0, note);
+            send_result(fd, 409, "Conflict", false, 0, message);
+            log_add(g_client_ip, "VERSION ZU ALT");
+            diag_text(message);
+            conn_close();
+            return;
+        }
+
+        if (not_newer)
+        {
+            diag_text("Nicht neuere Version auf Wunsch installiert");
+        }
+    }
+
     send_result(fd, 200, "OK", true, &info, 0);
     log_add(g_client_ip, "PKG EMPFANGEN");
 
@@ -845,6 +926,8 @@ static void conn_write_body(const char *data, int bytes)
 static bool conn_begin_upload(const char *target, unsigned long long content_length)
 {
     int used = 0;
+
+    g_conn.force = strstr(target, "force=1") != 0;
 
     if (!pin_allow_upload(target))
     {

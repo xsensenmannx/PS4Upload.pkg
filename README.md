@@ -156,6 +156,25 @@ erzeugt daraus `ps4app/version.h` fuer die UI, der Build schreibt dieselbe
 Version als `APP_VER` in `param.sfo`, und der Release-Tag ist `v<version>`
 (`python tools/version.py tag`).
 
+### Release-Build mit GitHub Actions
+
+[`.github/workflows/build-pkg.yml`](.github/workflows/build-pkg.yml) baut bei
+jedem veroeffentlichten Release und auf manuellen Start:
+
+1. Quellen aus dem Tag; `version.txt` muss zum Tag passen, sonst bricht der Job ab
+2. gepinnte Werkzeuge: `ziglang==0.17.1`, OpenOrbis-Toolchain v0.5.4 (SHA-256
+   im Skript), .NET 8
+3. `SOURCE_DATE_EPOCH` kommt aus dem Commit und ersetzt den GP4-Zeitstempel;
+   ein zweiter Build muss byte-identisch sein
+4. `SHA256SUMS` und die PKG werden an das Release gehaengt (`--clobber`)
+
+Nach dem Download pruefen: `sha256sum -c SHA256SUMS`. Lokal laesst sich der
+CI-Build nachstellen, wenn dieselben Werkzeugversionen installiert sind:
+
+```bash
+SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) python tools/ps4pkg.py build
+```
+
 Die Kette ist ELF -> FSELF (`create-fself`) -> `param.sfo`/`.gp4` -> fPKG
 (`PkgTool` aus LibOrbisPkg). Das Paket ist **kein** Sony-signiertes PKG: es hat
 Passcode 0 und braucht eine jailbreakte PS4 mit GoldHEN/HEN. Senden laesst es
@@ -176,7 +195,10 @@ Die Seite nimmt inzwischen auch eine PKG an: Der Datei-Body wird nach
 `param.sfo`) und ueber BGFT installiert. Vor dem Upload muss die vierstellige
 PIN eingegeben werden, die auf dem Fernseher steht; falsche Versuche erscheinen
 im INSTALL-Reiter und im Kernel-Log, nach fuenf Fehlversuchen ist der Upload
-eine Minute gesperrt. Der INSTALL-Reiter auf dem Fernseher
+eine Minute gesperrt. Eine Update-Karte auf der Seite prueft den GitHub-Release,
+vergleicht ihn mit der installierten Version und schickt die neue PKG ueber
+denselben Upload-Weg; gleiche oder aeltere Versionen werden serverseitig
+abgewiesen und erst nach Bestaetigung mit `force=1` installiert. Der INSTALL-Reiter auf dem Fernseher
 zeigt Upload- und Installationsfortschritt. Ob BGFT eine selbstgebaute,
 unsignierte PKG auf Retail-Firmware annimmt, ist ungetestet.
 

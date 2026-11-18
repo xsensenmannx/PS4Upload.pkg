@@ -18,6 +18,7 @@ struct PkgInfo
     char title[68];
     char title_id[16];
     char content_id[40];
+    char app_ver[8];
     unsigned long long size;
     char error[72];
 };
@@ -49,6 +50,42 @@ static void pkg_copy(char *destination, int capacity, const char *source, int li
         length++;
     }
     destination[length] = 0;
+}
+
+/* "MM.mm" -> MM*100+mm; -1, wenn das Format nicht passt. */
+static int pkg_version_value(const char *text)
+{
+    int major = 0;
+    int minor = 0;
+    int index = 0;
+
+    if (text == 0)
+    {
+        return -1;
+    }
+
+    while (index < 2 && text[index] >= '0' && text[index] <= '9')
+    {
+        major = major * 10 + (text[index] - '0');
+        index++;
+    }
+    if (index != 2 || text[2] != '.')
+    {
+        return -1;
+    }
+
+    index = 3;
+    while (index < 5 && text[index] >= '0' && text[index] <= '9')
+    {
+        minor = minor * 10 + (text[index] - '0');
+        index++;
+    }
+    if (index != 5 || text[5] != 0)
+    {
+        return -1;
+    }
+
+    return major * 100 + minor;
 }
 
 static void pkg_fail(PkgInfo *info, const char *message)
@@ -125,6 +162,10 @@ static bool pkg_parse_sfo(const unsigned char *sfo, int size, PkgInfo *info)
         else if (strncmp(key, "CONTENT_ID", 11) == 0 && key[10] == 0)
         {
             pkg_copy(info->content_id, sizeof(info->content_id), value, (int)length);
+        }
+        else if (strncmp(key, "APP_VER", 8) == 0 && key[7] == 0)
+        {
+            pkg_copy(info->app_ver, sizeof(info->app_ver), value, (int)length);
         }
     }
 

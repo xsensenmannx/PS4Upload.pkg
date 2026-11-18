@@ -5,6 +5,10 @@ Kette: C-Quellen -> ELF (clang/lld aus dem ``ziglang``-Paket) -> FSELF
 (``create-fself``) -> ``param.sfo`` (``PkgTool``) -> ``.gp4`` (``create-gp4``)
 -> ``.pkg`` (``PkgTool pkg_build``).
 
+Reproduzierbar: ``SOURCE_DATE_EPOCH`` (sonst der Commit-Zeitpunkt) ersetzt den
+Build-Zeitstempel im GP4; gleiche Quellen und Tool-Versionen ergeben damit
+dasselbe PKG.
+
 Befehle:
     python tools/ps4pkg.py check
     python tools/ps4pkg.py fetch-sdk
@@ -17,11 +21,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import shutil
 import struct
 import subprocess
 import sys
 import tarfile
+import time
 import urllib.request
 from pathlib import Path
 
@@ -57,6 +63,46 @@ def current_version() -> tuple[int, int, int]:
         return version_source.read_version()
     except version_source.VersionError as exc:
         raise BuildError(str(exc)) from exc
+
+
+def source_date_epoch() -> int:
+    """Fixer Zeitstempel fuer reproduzierbare Builds.
+
+    ``SOURCE_DATE_EPOCH`` gewinnt; sonst der Commit-Zeitpunkt des HEADs,
+    damit lokaler und CI-Build denselben GP4-Stempel bekommen.
+    """
+    value = os.environ.get("SOURCE_DATE_EPOCH")
+    if value:
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise BuildError("SOURCE_DATE_EPOCH ist keine Unix-Zeit") from exc
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(ROOT), "log", "-1", "--format=%ct"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return int(result.stdout.strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0
+
+
+def normalize_gp4(gp4_path: Path, epoch: int) -> str:
+    """Ersetzt den Build-Zeitpunkt im GP4 durch einen festen Wert."""
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(epoch))
+    data = gp4_path.read_bytes()
+    normalized, count = re.subn(
+        rb"<volume_ts>[^<]*</volume_ts>",
+        f"<volume_ts>{stamp}</volume_ts>".encode("ascii"),
+        data,
+    )
+    if count != 1:
+        raise BuildError("volume_ts im GP4 nicht gefunden")
+    gp4_path.write_bytes(normalized)
+    return stamp
 
 
 def sfo_entries() -> list[tuple[str, str, int, str]]:
@@ -269,6 +315,9 @@ def build(out_dir: Path) -> Path:
         f"--content-id={CONTENT_ID}",
         "--files", "eboot.bin sce_sys/param.sfo sce_sys/icon0.png",
     ], cwd=pkgroot)
+
+    stamp = normalize_gp4(pkgroot / "pkg.gp4", source_date_epoch())
+    print(f"GP4-Zeitstempel fixiert: {stamp} UTC")
 
     print("6/6 PKG bauen")
     pkgtool("pkg_build", "pkg.gp4", ".", cwd=pkgroot)

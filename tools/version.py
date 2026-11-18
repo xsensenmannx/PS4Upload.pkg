@@ -76,6 +76,7 @@ def header_text(parts: tuple[int, int, int]) -> str:
         HEADER_COMMENT
         + "#pragma once\n\n"
         + f'#define APP_VERSION "{format_version(parts)}"\n'
+        + f'#define APP_VER "{format_app_ver(parts)}"\n'
     )
 
 

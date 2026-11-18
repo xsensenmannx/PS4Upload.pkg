@@ -1,0 +1,115 @@
+name: PKG bauen
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Vorhandener Release-Tag (z. B. v0.5.2)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pkg-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: PKG bauen und an das Release haengen
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      DOTNET_ROLL_FORWARD: LatestMajor
+      TZ: UTC
+    steps:
+      - name: Quellen aus dem Tag auschecken
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          fetch-depth: 0
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: .NET einrichten
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Version gegen Tag pruefen
+        shell: bash
+        run: |
+          expected="$(python tools/version.py tag)"
+          echo "Tag: $TAG, version.txt: $expected"
+          if [ "$TAG" != "$expected" ]; then
+            echo "::error::Tag $TAG passt nicht zu version.txt ($expected)"
+            exit 1
+          fi
+          python tools/version.py check
+
+      - name: Gepinnte Toolchain cachen
+        uses: actions/cache@v4
+        with:
+          path: |
+            ps4sdk
+            .tmp/toolchain-llvm-18.tar.gz
+          key: orbis-toolchain-0.5.4-3c7cd5bb
+
+      - name: Gepinnte Werkzeuge installieren
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check "ziglang==0.17.1"
+          python tools/ps4pkg.py fetch-sdk
+
+      - name: Build-Zeitpunkt aus dem Commit fixieren
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+      - name: PKG bauen
+        shell: bash
+        run: python tools/ps4pkg.py build
+
+      - name: Reproduzierbarkeit pruefen
+        shell: bash
+        run: |
+          python tools/ps4pkg.py build --out .tmp/rebuild
+          first="dist/PS4Upload-Direkt-BREW00090.pkg"
+          second=".tmp/rebuild/PS4Upload-Direkt-BREW00090.pkg"
+          if ! cmp -s "$first" "$second"; then
+            echo "::error::Zweiter Build ist nicht byte-identisch"
+            sha256sum "$first" "$second"
+            exit 1
+          fi
+          sha256sum "$first" | tee .tmp/hash.txt
+
+      - name: SHA256SUMS erzeugen
+        shell: bash
+        working-directory: dist
+        run: |
+          sha256sum PS4Upload-Direkt-BREW00090.pkg > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Release-Assets anhaengen
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG" \
+            dist/PS4Upload-Direkt-BREW00090.pkg \
+            dist/SHA256SUMS \
+            --clobber
+
+      - name: Build-Artefakt sichern
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ env.TAG }}
+          path: |
+            dist/PS4Upload-Direkt-BREW00090.pkg
+            dist/SHA256SUMS
+          if-no-files-found: error

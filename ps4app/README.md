@@ -81,7 +81,8 @@ weiter, die Konsole bleibt also ansprechbar, auch wenn das Bild fehlt.
 |---|---|
 | `/` | HTML-Seite mit Upload-Formular und Live-Status |
 | `/status` | JSON inkl. `install` (phase, percent, error, title, file, note) |
-| `/upload?name=datei.pkg&pin=1234` (POST) | Nimmt den rohen Datei-Body an, prueft die PIN, streamt nach `/data/ps4upload/`, prueft die PKG und startet BGFT; falsche PIN → 403 |
+| `/upload?name=datei.pkg&pin=1234` (POST) | Nimmt den rohen Datei-Body an, prueft die PIN, streamt nach `/data/ps4upload/`, prueft die PKG und startet BGFT; falsche PIN → 403, gleiche/aeltere APP_VER → 409 |
+| `/upload?...&force=1` (POST) | Wie oben, installiert aber auch eine gleiche oder aeltere Version nach ausdruecklicher Bestaetigung |
 | sonst | 404; unbekannte Methode → 405, fehlende Content-Length → 411, Schreibfehler → 507 |
 
 ## Upload-PIN
@@ -99,6 +100,27 @@ ausschliesslich auf der PS4.
 - Ein erfolgreicher Upload setzt Zaehler und Sperre zurueck
 - Die PIN taucht weder in `/status` noch in der HTML-Seite auf
 
+## Update vom Handy
+
+Die Seite hat eine Update-Karte. `Release pruefen` fragt die GitHub-API
+(`releases/latest`) ab und vergleicht den Tag mit der Version aus `/status`:
+
+- neuer → `Update 0.5.2 verfuegbar`, Buttons `PKG laden` und `Datei waehlen`
+- gleich → `Bereits aktuell`
+- aelter → Hinweis, dass die installierte Version neuer ist
+
+Release-Assets liefern kein CORS (`Access-Control-Allow-Origin` fehlt), die
+Seite kann den PKG-Body deshalb nicht selbst per `fetch` ziehen. `PKG laden`
+startet den Download im Browser, `Datei waehlen` oeffnet die Dateiauswahl;
+danach laeuft der normale Upload mit PIN.
+
+Der Server liest `APP_VER` aus der `param.sfo` der hochgeladenen PKG und
+vergleicht sie mit seiner eigenen (`APP_VER` aus `version.txt`). Ist sie
+gleich oder aelter, antwortet er mit HTTP 409, loescht die Datei und
+installiert nicht; die Seite fragt `Trotzdem installieren?` und sendet erneut
+mit `&force=1`. Der Fehlversuch steht als `VERSION ZU ALT` im Kernel-Log und
+im INSTALL-Reiter.
+
 ## PKG-Empfang und Installation
 
 1. PS5/Handy oeffnet die Seite, waehlt eine `.pkg`, das JavaScript sendet den
@@ -107,7 +129,7 @@ ausschliesslich auf der PS4.
    `/data/ps4upload/<name>.pkg` - kein RAM-Puffer fuer die ganze Datei.
    Fortschritt steht live im INSTALL-Reiter und in `/status`.
 3. Nach dem letzten Byte prueft `pkg.h` Magic `7f434e54`, Header-Groesse,
-   Eintragstabelle und `param.sfo` (Titel, Title-ID, Content-ID).
+   Eintragstabelle und `param.sfo` (Titel, Title-ID, Content-ID, APP_VER).
 4. `install.h` initialisiert BGFT, registriert einen Task mit
    `file:///data/ps4upload/<name>.pkg`, startet ihn und pollt
    `sceBgftServiceIntDownloadGetProgress`.
