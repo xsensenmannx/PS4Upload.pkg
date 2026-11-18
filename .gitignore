@@ -6,3 +6,6 @@ venv/
 .tmp/
 upstream-ps5upload/
 .freebuff/
+build/
+dist/
+*.spec
