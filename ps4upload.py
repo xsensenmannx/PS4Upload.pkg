@@ -14,6 +14,7 @@ import json
 import os
 import re
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -27,10 +28,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 APP_NAME = "PS4Upload"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 PKG_MAGIC = b"\x7fCNT"
 RPI_PORT = 12800
+GOLDHEN_PORT = 9090
 CHUNK = 256 * 1024
+PAYLOAD_MARKER = b"\xb4" * 6
+PACKAGE_TYPES = {
+    "gd": "PS4GD",
+    "gp": "PS4DP",
+    "ac": "PS4AC",
+    "la": "PS4LA",
+    "gde": "PS4GDE",
+}
 
 TITLE_ID_RE = re.compile(r"(CUSA\d{5}|PPSA\d{5})", re.IGNORECASE)
 SPLIT_RE = re.compile(r"^(?P<base>.+?)_(?P<idx>\d{1,4})\.pkg$", re.IGNORECASE)
@@ -171,6 +181,98 @@ def is_pkg_file(path: Path) -> bool:
         return False
 
 
+def parse_sfo(buf: bytes) -> dict:
+    """Minimal PARAM.SFO reader for the keys PS4Upload needs."""
+    values: dict[str, str] = {}
+    if len(buf) < 0x14 or buf[:4] != b"\0PSF":
+        return values
+    keys_off = int.from_bytes(buf[8:12], "little")
+    data_off = int.from_bytes(buf[12:16], "little")
+    count = int.from_bytes(buf[16:20], "little")
+    for index in range(min(count, 256)):
+        entry = buf[0x14 + index * 16 : 0x14 + (index + 1) * 16]
+        if len(entry) < 16:
+            break
+        key_off = int.from_bytes(entry[0:2], "little")
+        fmt = int.from_bytes(entry[2:4], "little")
+        length = int.from_bytes(entry[4:8], "little")
+        value_off = int.from_bytes(entry[12:16], "little")
+        key_start = keys_off + key_off
+        key_end = buf.find(b"\0", key_start)
+        if key_start >= len(buf) or key_end < 0:
+            continue
+        key = buf[key_start:key_end].decode("utf-8", "replace")
+        raw = buf[data_off + value_off : data_off + value_off + length]
+        if fmt == 0x0204:
+            values[key] = raw.rstrip(b"\0").decode("utf-8", "replace")
+        elif fmt == 0x0404 and len(raw) >= 4:
+            values[key] = str(int.from_bytes(raw[:4], "little"))
+    return values
+
+
+def read_pkg_meta(path: Path) -> dict:
+    """Read content id, title and BGFT package type from a PS4 PKG."""
+    meta = {
+        "content_id": "",
+        "title": "",
+        "title_id": "",
+        "category": "",
+        "app_ver": "",
+        "package_type": "PS4GD",
+    }
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(0x1000)
+            if head[:4] != PKG_MAGIC or len(head) < 0x80:
+                return meta
+            content_id = head[0x40:0x64].split(b"\0")[0].decode("ascii", "ignore").strip()
+            meta["content_id"] = content_id
+            entry_count = int.from_bytes(head[0x10:0x14], "big")
+            table_offset = int.from_bytes(head[0x18:0x1C], "big")
+            if 0 < entry_count <= 1024:
+                fh.seek(table_offset)
+                table = fh.read(entry_count * 0x20)
+                sfo_offset = sfo_size = 0
+                for index in range(entry_count):
+                    entry = table[index * 0x20 : (index + 1) * 0x20]
+                    if len(entry) < 0x20:
+                        break
+                    if int.from_bytes(entry[0:4], "big") == 0x1000:
+                        sfo_offset = int.from_bytes(entry[0x10:0x14], "big")
+                        sfo_size = int.from_bytes(entry[0x14:0x18], "big")
+                        break
+                if 0 < sfo_size <= 4 * 1024 * 1024:
+                    fh.seek(sfo_offset)
+                    values = parse_sfo(fh.read(sfo_size))
+                    meta["title"] = values.get("TITLE", "")
+                    meta["title_id"] = values.get("TITLE_ID", "")
+                    meta["category"] = values.get("CATEGORY", "")
+                    meta["app_ver"] = values.get("APP_VER", "")
+                    if not meta["content_id"]:
+                        meta["content_id"] = values.get("CONTENT_ID", "")
+    except OSError:
+        return meta
+    meta["package_type"] = PACKAGE_TYPES.get(meta["category"].lower(), "PS4GD")
+    return meta
+
+
+def patch_payload(data: bytes, host_ip: str, port: int) -> bytes:
+    """Patch the installer payload with this computer's callback address."""
+    offset = data.find(PAYLOAD_MARKER)
+    if offset < 0:
+        raise ValueError("GoldHEN-Payload hat keinen Verbindungs-Marker.")
+    address = ipaddress.IPv4Address(host_ip).packed
+    patched = bytearray(data)
+    patched[offset : offset + 4] = address
+    patched[offset + 4 : offset + 6] = struct.pack(">H", port)
+    return bytes(patched)
+
+
+def resource_path(relative: str) -> Path:
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / relative
+
+
 def split_info(path: Path):
     for pattern in (SPLIT_RE, SPLIT_DOT_RE):
         m = pattern.match(path.name)
@@ -272,6 +374,10 @@ class Job:
     name: str
     title_id: str
     size: int
+    content_id: str = ""
+    package_type: str = "PS4GD"
+    pkg_title: str = ""
+    mode: str = ""
     state: str = "queued"
     task_id: int | None = None
     transferred: int = 0
@@ -287,6 +393,9 @@ class Job:
             "id": self.id,
             "name": self.name,
             "title_id": self.title_id,
+            "content_id": self.content_id,
+            "package_type": self.package_type,
+            "mode": self.mode,
             "files": [p.name for p in self.files],
             "parts": len(self.files),
             "size": self.size,
@@ -314,12 +423,28 @@ class Job:
 
 
 class App:
-    def __init__(self, host_ip: str, port: int, console_ip: str, console_port: int):
+    def __init__(
+        self,
+        host_ip: str,
+        port: int,
+        console_ip: str,
+        console_port: int,
+        mode: str = "auto",
+        goldhen_port: int = GOLDHEN_PORT,
+        goldhen_payload: str = "",
+    ):
         self.host_ip = host_ip.strip()
         self.default_ip = lan_ip()
         self.port = port
         self.console_ip = console_ip
         self.console_port = console_port
+        self.mode = mode if mode in ("auto", "rpi", "goldhen") else "auto"
+        self.goldhen_port = goldhen_port
+        self.goldhen_payload = (
+            Path(goldhen_payload).expanduser().resolve()
+            if goldhen_payload
+            else resource_path("goldhen/payload.bin")
+        )
         self.lock = threading.RLock()
         self.jobs: dict[int, Job] = {}
         self.next_id = 1
@@ -356,10 +481,20 @@ class App:
             return self._probe
 
         ip = self.console_ip.strip()
-        info = {"ip": ip, "port": self.console_port, "reachable": False, "api": None}
+        info = {
+            "ip": ip,
+            "port": self.console_port,
+            "reachable": False,
+            "api": None,
+            "rpi": False,
+            "goldhen": False,
+            "goldhen_port": self.goldhen_port,
+        }
         if ip:
-            info["reachable"] = self._tcp_reachable(ip, self.console_port)
-            if info["reachable"]:
+            info["rpi"] = self._tcp_reachable(ip, self.console_port, timeout=0.4)
+            info["goldhen"] = self._tcp_reachable(ip, self.goldhen_port, timeout=0.4)
+            info["reachable"] = info["rpi"] or info["goldhen"]
+            if info["rpi"]:
                 info["api"] = "legacy"
                 try:
                     url = f"http://{ip}:{self.console_port}/api/v2/system"
@@ -452,6 +587,25 @@ class App:
         self.host_ip = ip
         self.log(f"PC-Netzwerk: {ip or 'automatisch'}")
 
+    def install_mode(self) -> str:
+        if self.mode in ("rpi", "goldhen"):
+            return self.mode
+        info = self.console_info()
+        if info["rpi"]:
+            return "rpi"
+        if info["goldhen"]:
+            return "goldhen"
+        return "rpi"
+
+    def set_mode(self, mode: str) -> None:
+        mode = mode.strip().lower()
+        if mode not in ("auto", "rpi", "goldhen"):
+            raise ValueError("Unbekannter Modus.")
+        self.mode = mode
+        self._probe = None
+        self._probe_at = 0.0
+        self.log(f"Installationsmodus: {mode}")
+
     def ps4_post(self, path: str, payload: dict, timeout: float = 15.0) -> dict:
         if not self.console_ip:
             return {"status": "fail", "error": "Keine PS4-IP eingetragen."}
@@ -517,12 +671,16 @@ class App:
                 if key in known:
                     skipped += 1
                     continue
+                meta = read_pkg_meta(group[0])
                 job = Job(
                     id=self.next_id,
                     files=group,
                     name=job_name(group),
-                    title_id=title_id_of(group),
+                    title_id=meta["title_id"] or title_id_of(group),
                     size=sum(p.stat().st_size for p in group),
+                    content_id=meta["content_id"],
+                    package_type=meta["package_type"],
+                    pkg_title=meta["title"],
                 )
                 self.jobs[job.id] = job
                 self.next_id += 1
@@ -581,7 +739,9 @@ class App:
 
     def remove_job(self, job: Job) -> None:
         with self.lock:
-            if job.state in ("sending", "transferring", "installing"):
+            if job.state in ("sending", "transferring") or (
+                job.state == "installing" and job.mode != "goldhen"
+            ):
                 raise ValueError("Auftrag laeuft noch - bitte zuerst stoppen.")
             self.jobs.pop(job.id, None)
         self.log(f"Entfernt: {job.name}")
@@ -613,6 +773,136 @@ class App:
         self.log(f"Fehler bei {job.name}: {message}")
 
     def _run(self, job: Job) -> None:
+        if not self.console_ip:
+            self._fail(job, "Keine PS4-IP eingetragen.")
+            return
+        if self.install_mode() == "goldhen":
+            self._run_goldhen(job)
+        else:
+            self._run_rpi(job)
+
+    def _run_goldhen(self, job: Job) -> None:
+        stop = threading.Event()
+        with self.lock:
+            self.stop_events[job.id] = stop
+        listener = None
+        try:
+            if len(job.files) != 1:
+                self._fail(
+                    job,
+                    "Der GoldHEN-Modus unterstuetzt nur einzelne PKG-Dateien. "
+                    "Geteilte Pakete brauchen den Remote Package Installer.",
+                )
+                return
+            if not job.content_id:
+                self._fail(job, "Content-ID konnte nicht aus der PKG gelesen werden.")
+                return
+            if not self.goldhen_payload.is_file():
+                self._fail(job, f"GoldHEN-Payload fehlt: {self.goldhen_payload}")
+                return
+
+            job.mode = "goldhen"
+            job.state = "sending"
+            job.message = "GoldHEN-Payload wird gesendet ..."
+            self.log(f"Sende GoldHEN-Payload an {self.console_ip}:{self.goldhen_port}")
+
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("0.0.0.0", 0))
+            listener.listen(2)
+            listener.settimeout(1.0)
+            callback_ip = self.effective_ip()
+            callback_port = listener.getsockname()[1]
+            patched = patch_payload(
+                self.goldhen_payload.read_bytes(), callback_ip, callback_port
+            )
+
+            try:
+                with socket.create_connection(
+                    (self.console_ip, self.goldhen_port), timeout=5.0
+                ) as loader:
+                    loader.sendall(patched)
+                    loader.shutdown(socket.SHUT_WR)
+            except OSError as exc:
+                self._fail(
+                    job,
+                    f"GoldHEN BinLoader auf Port {self.goldhen_port} nicht erreichbar ({exc}).",
+                )
+                return
+
+            job.message = "Warte auf den Installer auf der PS4 ..."
+            connection = None
+            deadline = time.time() + 20.0
+            while time.time() < deadline and not stop.is_set():
+                try:
+                    candidate, address = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                if address[0] in (self.console_ip, callback_ip):
+                    connection = candidate
+                    break
+                candidate.close()
+
+            if stop.is_set():
+                job.state = "stopped"
+                job.message = "Gestoppt"
+                return
+            if connection is None:
+                self._fail(
+                    job,
+                    "Die GoldHEN-Payload hat sich nicht zurueckgemeldet - Firewall pruefen.",
+                )
+                return
+
+            with connection:
+                connection.settimeout(10.0)
+                connection.sendall(self._goldhen_message(job))
+
+            job.state = "installing"
+            job.percent = 0.0
+            job.total = job.size
+            job.transferred = 0
+            job.speed = 0.0
+            job.message = "GoldHEN: Installation angestossen - Fortschritt auf der PS4."
+            self.log(f"GoldHEN-Auftrag uebergeben: {job.name}")
+
+            listener.settimeout(4.0)
+            try:
+                exit_socket, address = listener.accept()
+                if address[0] in (self.console_ip, callback_ip):
+                    exit_socket.sendall(struct.pack("<I", 0))
+                exit_socket.close()
+            except (socket.timeout, OSError):
+                pass
+        except (OSError, ValueError) as exc:
+            self._fail(job, f"GoldHEN-Fehler: {exc}")
+        finally:
+            if listener is not None:
+                try:
+                    listener.close()
+                except OSError:
+                    pass
+            with self.lock:
+                self.stop_events.pop(job.id, None)
+
+    def _goldhen_message(self, job: Job) -> bytes:
+        def field(text: str) -> bytes:
+            raw = text.encode("utf-8", "replace")
+            return struct.pack("<I", len(raw)) + raw
+
+        return (
+            struct.pack("<I", 1)
+            + field(self._pkg_url(job, 0))
+            + field(job.pkg_title or job.name)
+            + field(job.content_id)
+            + field(job.package_type or "PS4GD")
+            + struct.pack("<Q", job.size)
+            + struct.pack("<I", 0)
+        )
+
+    def _run_rpi(self, job: Job) -> None:
         stop = threading.Event()
         with self.lock:
             self.stop_events[job.id] = stop
@@ -620,7 +910,7 @@ class App:
             if not self.console_ip:
                 self._fail(job, "Keine PS4-IP eingetragen.")
                 return
-
+            job.mode = "rpi"
             job.state = "sending"
             job.message = "Installationsauftrag wird an die PS4 gesendet ..."
             urls = [self._pkg_url(job, i) for i in range(len(job.files))]
@@ -735,6 +1025,12 @@ class App:
         network = self.network_state()
         return {
             "version": VERSION,
+            "mode": self.mode,
+            "install_mode": self.install_mode(),
+            "goldhen_payload": {
+                "path": str(self.goldhen_payload),
+                "exists": self.goldhen_payload.is_file(),
+            },
             "server": {
                 "url": network["url"],
                 "ip": network["ip"],
@@ -863,6 +1159,15 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_error_json(str(exc), 400)
                     return
                 self._send_json({"ok": True, "network": self.app.network_state()})
+                return
+
+            if path == "/api/mode":
+                try:
+                    self.app.set_mode(str(body.get("mode") or "auto"))
+                except ValueError as exc:
+                    self._send_error_json(str(exc), 400)
+                    return
+                self._send_json({"ok": True, "mode": self.app.mode})
                 return
 
             if path == "/api/add":
@@ -1095,6 +1400,15 @@ pre#log{
       <select id="networkSelect" aria-label="Netzwerk fuer die PS4 waehlen"></select>
       <code id="serverUrl"></code>
     </div>
+    <div class="net">
+      <span class="muted small">Installation</span>
+      <select id="modeSelect" aria-label="Installationsmodus waehlen">
+        <option value="auto">Automatisch</option>
+        <option value="rpi">Remote Package Installer (12800)</option>
+        <option value="goldhen">GoldHEN Payload (BinLoader)</option>
+      </select>
+      <span id="modeHint" class="muted small"></span>
+    </div>
     <p id="networkHint" class="muted small" style="margin:8px 0 0"></p>
   </section>
 
@@ -1189,10 +1503,10 @@ function jobCard(job){
     const text = job.state === "queued" ? "Installieren" : "Erneut versuchen";
     actions += '<button class="primary small" data-act="install" data-id="' + job.id + '">' + text + '</button>';
   }
-  if (ACTIVE.includes(job.state)){
+  if ((job.state === "sending" && job.mode === "goldhen") || (ACTIVE.includes(job.state) && job.task_id)){
     actions += '<button class="small" data-act="stop" data-id="' + job.id + '">Stoppen</button>';
   }
-  if (!ACTIVE.includes(job.state)){
+  if (!ACTIVE.includes(job.state) || (job.mode === "goldhen" && job.state === "installing")){
     actions += '<button class="ghost small" data-act="remove" data-id="' + job.id + '">Entfernen</button>';
   }
 
@@ -1204,6 +1518,22 @@ function jobCard(job){
     + '<div class="job-foot"><div class="' + msgClass + '">' + esc(message) + '</div>'
     + '<div class="job-actions">' + actions + '</div></div>'
     + '</div>';
+}
+
+function renderMode(state){
+  const select = $("#modeSelect");
+  if (document.activeElement !== select) select.value = state.mode || "auto";
+  const hint = $("#modeHint");
+  const payload = state.goldhen_payload || {};
+  if (payload.exists === false && state.mode !== "rpi"){
+    hint.textContent = "GoldHEN-Payload fehlt";
+    hint.style.color = "var(--warn)";
+  } else if (state.mode === "goldhen"){
+    hint.textContent = "BinLoader Port " + ((state.console && state.console.goldhen_port) || 9090);
+    hint.style.color = "";
+  } else {
+    hint.textContent = "";
+  }
 }
 
 function renderNetwork(state){
@@ -1237,17 +1567,20 @@ function render(state){
   dot.className = "dot " + (consoleInfo.reachable ? "ok" : "bad");
   if (!consoleInfo.ip){
     text.textContent = "Remote Package Installer auf der PS4 starten, dann die IP eintragen.";
-  } else if (consoleInfo.reachable){
-    const api = consoleInfo.api === "v2" ? " · API v2" : "";
-    text.textContent = "Verbunden mit " + consoleInfo.ip + ":" + consoleInfo.port + api + " - bereit.";
+  } else   if (consoleInfo.reachable){
+    const parts = [];
+    if (consoleInfo.rpi) parts.push("RPI " + consoleInfo.port);
+    if (consoleInfo.goldhen) parts.push("GoldHEN " + consoleInfo.goldhen_port);
+    text.textContent = "Verbunden mit " + consoleInfo.ip + " - " + parts.join(" + ") + " bereit.";
   } else {
-    text.textContent = "Keine Verbindung zu " + consoleInfo.ip + ":" + consoleInfo.port + " - laeuft der Remote Package Installer?";
+    text.textContent = "Keine Verbindung zu " + consoleInfo.ip + " - RPI starten oder GoldHEN-BinLoader aktivieren.";
   }
 
   const ipInput = $("#ipInput");
   if (document.activeElement !== ipInput) ipInput.value = consoleInfo.ip || "";
 
   renderNetwork(state);
+  renderMode(state);
 
   const jobs = state.jobs || [];
   $("#jobs").innerHTML = jobs.length
@@ -1298,6 +1631,13 @@ $("#networkSelect").addEventListener("change", async (event) => {
   } catch (error){ toast(error.message); }
 });
 
+$("#modeSelect").addEventListener("change", async (event) => {
+  try {
+    await api("/api/mode", {mode: event.target.value});
+    toast("Installationsmodus gespeichert");
+  } catch (error){ toast(error.message); }
+});
+
 $("#jobs").addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-act]");
   if (!button) return;
@@ -1335,6 +1675,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--list-networks", action="store_true", help="Lokale IPv4-Netzwerke anzeigen und beenden")
     parser.add_argument("--console", default="", help="IP der PS4")
     parser.add_argument("--console-port", type=int, default=RPI_PORT, help="RPI-Port der PS4 (Standard: 12800)")
+    parser.add_argument(
+        "--mode", choices=("auto", "rpi", "goldhen"), default="auto",
+        help="Installationsweg: auto, rpi oder goldhen (Standard: auto)",
+    )
+    parser.add_argument("--goldhen-port", type=int, default=GOLDHEN_PORT, help="GoldHEN-BinLoader-Port (Standard: 9090)")
+    parser.add_argument("--goldhen-payload", default="", help="Pfad zu einer eigenen GoldHEN-Installer-Payload (.bin)")
     parser.add_argument("--no-browser", action="store_true", help="Browser nicht automatisch oeffnen")
     args = parser.parse_args(argv)
 
@@ -1348,6 +1694,9 @@ def main(argv: list[str] | None = None) -> int:
         port=args.port,
         console_ip=args.console.strip(),
         console_port=args.console_port,
+        mode=args.mode,
+        goldhen_port=args.goldhen_port,
+        goldhen_payload=args.goldhen_payload,
     )
 
     try:
@@ -1372,6 +1721,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Fuer PS4: http://{app.effective_ip()}:{args.port}")
     print("Die PS4 muss diese Adresse im LAN erreichen koennen (Firewall!).")
     print("Web-UI/API nur lokal; im LAN sind nur /pkg/...-Downloads erlaubt.")
+    print(f"Modus:    {app.mode} (GoldHEN-Payload: {'ok' if app.goldhen_payload.is_file() else 'fehlt'})")
     if app.console_ip:
         print(f"PS4:      {app.console_ip}:{app.console_port}")
     else:

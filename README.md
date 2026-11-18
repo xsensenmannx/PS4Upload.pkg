@@ -12,10 +12,13 @@ Stand nutzt stattdessen die auf der PS4 verbreitete Remote-Package-Installer-API
 ## Voraussetzungen
 
 - Python 3.10 oder neuer (nur Standardbibliothek, keine Installation nötig)
-- PS4 mit Jailbreak und laufendem **Remote Package Installer**:
-  - [flatz/ps4_remote_pkg_installer](https://github.com/flatz/ps4_remote_pkg_installer) oder
-  - [AldySan/ps4_remote_pkg_installer_nextgen](https://github.com/AldySan/ps4_remote_pkg_installer_nextgen)
-- PC und PS4 im selben LAN; Port `9898` (PC) muss in der Firewall erlaubt sein
+- PS4 mit Jailbreak und einem Installationsdienst:
+  - **Remote Package Installer** (Port `12800`):
+    [flatz/ps4_remote_pkg_installer](https://github.com/flatz/ps4_remote_pkg_installer) oder
+    [AldySan/ps4_remote_pkg_installer_nextgen](https://github.com/AldySan/ps4_remote_pkg_installer_nextgen)
+  - **GoldHEN** mit aktiviertem **BinLoader** (Port `9090`), siehe unten
+- PC und PS4 im selben LAN; Port `9898` (PC) muss in der Firewall erlaubt sein.
+  Im GoldHEN-Modus zusätzlich die Rückverbindung der Payload erlauben
 - PS4-PKG-Dateien (Header `7F 43 4E 54`), auch geteilte Pakete (`_0.pkg`, `_1.pkg`, ...)
 
 ## Start
@@ -43,6 +46,9 @@ python ps4upload.py --console 192.168.0.50 "D:\Spiele\CUSA00000.pkg"
 | `--list-networks` | Lokale IPv4-Adressen und Adapter anzeigen und beenden |
 | `--console 192.168.0.50` | IP der PS4 (sonst im Browser eintragen) |
 | `--console-port 12800` | Port des Remote Package Installers |
+| `--mode auto\|rpi\|goldhen` | Installationsweg (Standard: `auto`) |
+| `--goldhen-port 9090` | Port von GoldHENs BinLoader |
+| `--goldhen-payload DATEI` | eigene Installer-Payload (`.bin`) statt der mitgelieferten |
 | `--no-browser` | Browser nicht automatisch öffnen |
 
 ## Netzwerk auswählen
@@ -59,9 +65,42 @@ Auf der Konsole zeigt `python ps4upload.py --list-networks` alle Kandidaten:
 10.0.0.5        /24 Ethernet
 ```
 
+## GoldHEN statt Remote Package Installer
+
+PS4Upload kann die Installation über GoldHENs **BinLoader** (Port 9090) anstoßen,
+ohne dass auf der PS4 der Remote Package Installer laufen muss.
+
+1. GoldHEN starten und in den GoldHEN-Einstellungen den **BinLoader** aktivieren
+   (Port 9090).
+2. In PS4Upload unter **Installation** den Modus **GoldHEN Payload (BinLoader)** wählen
+   oder **Automatisch** lassen: RPI hat Vorrang, sonst wird GoldHEN benutzt.
+3. PKG hinzufügen und **Installieren** drücken. PS4Upload schickt die mitgelieferte
+   Installer-Payload an den BinLoader; die PS4 verbindet sich zurück und lädt die PKG
+   über die angezeigte URL.
+4. Den Fortschritt zeigt die PS4 in ihrer Download-/Benachrichtigungsliste. PS4Upload
+   kann ihn in diesem Modus nicht auslesen; der Auftrag steht auf „Installation“.
+
+Die Payload liegt unter `goldhen/payload.bin` und stammt aus
+[DirectPackageInstaller](https://github.com/marcussacana/DirectPackageInstaller)
+(GPL-3.0, Commit `ca7bade`, SHA-256 siehe [goldhen/README.md](goldhen/README.md)).
+Sie wird unverändert weitergegeben; mit `--goldhen-payload` lässt sich eine eigene
+`.bin` verwenden. Beim Bauen einer EXE die Payload mit
+`--add-data "goldhen/payload.bin;goldhen"` einbinden.
+
+**Grenzen des GoldHEN-Modus**
+
+- Nur einzelne PKG-Dateien. Geteilte Pakete (`_0.pkg`, `_1.pkg`) brauchen weiterhin RPI.
+- Kein Fortschritt in PS4Upload und kein Stopp der laufenden Installation. Stoppen
+  beendet nur das Senden vor der Übergabe an die PS4.
+- Der PC muss für die Rückverbindung der Payload erreichbar sein. Windows-Firewall
+  beim ersten Lauf erlauben; der Rückruf-Port ist dynamisch.
+- Das Senden eines Payloads führt Code auf der Konsole aus. Nur auf eigenem,
+  jailbreakten Gerät und auf eigenes Risiko verwenden.
+
 ## Was es kann
 
 - Netzwerkauswahl: WLAN, Ethernet oder VPN wählen; automatisch das Netz, in dem die PS4 hängt
+- Installation wahlweise über Remote Package Installer oder GoldHEN-BinLoader
 - PKG-Dateien und ganze Ordner hinzufügen; geteilte Pakete werden als ein Auftrag erkannt
 - HTTP-Server mit Range-Support (206/416), damit die PS4 Metadaten und Teile lesen kann
 - Installationsauftrag über `POST /api/install` (Typ `direct`, mehrere Teile in Reihenfolge)
@@ -72,10 +111,12 @@ Auf der Konsole zeigt `python ps4upload.py --list-networks` alle Kandidaten:
 
 ## Grenzen
 
-- Kein 1:1-Port von ps5upload: kein PS4-Payload, keine Dateiverwaltung/FTP, keine Spiele-Dumps
-  oder Cheats. Nur Senden und Installieren von PKGs.
-- Die PS4 braucht einen RPI-kompatiblen Dienst auf Port `12800`. GoldHEN allein reicht nicht,
-  solange dort kein RPI mitläuft.
+- Kein 1:1-Port von ps5upload: kein eigener PS4-Payload (nur die gebündelte
+  GoldHEN-Installer-Payload), keine Dateiverwaltung/FTP, keine Spiele-Dumps oder Cheats.
+  Nur Senden und Installieren von PKGs.
+- Der RPI-Modus braucht einen RPI-kompatiblen Dienst auf Port `12800`. Alternativ
+  funktioniert der GoldHEN-BinLoader auf Port `9090` ohne RPI (siehe oben), aber nur
+  für einzelne PKG-Dateien.
 - PS5 wird nicht unterstützt (dafür ist das Original gedacht).
 - **Web-UI und `/api` sind nur über localhost erreichbar.** Im LAN liefert der Server
   ausschließlich `/pkg/...` aus, damit die PS4 laden kann. Wer die Oberfläche von einem
