@@ -27,18 +27,18 @@ jobs:
       TZ: UTC
     steps:
       - name: Quellen aus dem Tag auschecken
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.release.tag_name || inputs.tag }}
           fetch-depth: 0
 
       - name: Python einrichten
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       - name: .NET einrichten
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: "8.0.x"
 
@@ -54,7 +54,7 @@ jobs:
           python tools/version.py check
 
       - name: Gepinnte Toolchain cachen
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ps4sdk
@@ -106,7 +106,7 @@ jobs:
             --clobber
 
       - name: Build-Artefakt sichern
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pkg-${{ env.TAG }}
           path: |
