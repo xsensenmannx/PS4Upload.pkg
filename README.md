@@ -1,15 +1,86 @@
-# PS4Upload
+<p align="center">
+  <img src="ps4app/sce_sys/icon0.png" width="150" alt="PS4Upload Direkt">
+</p>
 
-Schickt `.pkg`-Dateien vom PC an eine jailbreakte PS4 und startet dort die Installation.
-Die PS4 lädt das Paket über HTTP von diesem Rechner; der integrierte Server beherrscht
-HTTP-Range-Requests, die der PS4-Installer zwingend braucht.
+<h1 align="center">PS4Upload Direkt</h1>
+
+<p align="center">
+  <b>PKG-Upload und Installation direkt auf der PS4 – ohne PC im Ablauf.</b><br>
+  Die App liefert ihre Webseite selbst im LAN aus; Handy, PS5 oder PC öffnen sie im Browser.
+</p>
+
+<p align="center">
+  <a href="https://github.com/xsensenmannx/PS4Upload.pkg/releases/latest"><img src="https://img.shields.io/github/v/release/xsensenmannx/PS4Upload.pkg?label=release&amp;style=flat-square&amp;color=4f8cff" alt="Release"></a>
+  <img src="https://img.shields.io/badge/APP__VER-05.03-5ee7ff?style=flat-square" alt="APP_VER 05.03">
+  <img src="https://img.shields.io/badge/Plattform-PS4-003791?style=flat-square" alt="Plattform PS4">
+  <img src="https://img.shields.io/badge/Lizenz-GPL--3.0-5cffb1?style=flat-square" alt="GPL-3.0">
+  <img src="https://img.shields.io/badge/Status-pre--1.0-ffb4de?style=flat-square" alt="pre-1.0">
+</p>
+
+<p align="center">
+  <img src="docs/ps4-ui-preview.png" width="860" alt="PS4Upload Direkt: Status-Reiter auf dem Fernseher">
+</p>
+
+> **Status 0.5.3 (pre-1.0):** Kompilierung, PKG-Struktur und gerenderte Oberfläche sind auf dem PC geprüft. Der Lauf auf einer PS4 und die BGFT-Installation sind noch ungetestet – deshalb bleibt es bei 0.5.x, bis die Installation auf echter Hardware einmal durchgelaufen ist.
+
+## Die PS4-App
+
+PS4Upload Direkt ist eine native PS4-App (C, OpenOrbis). Sie läuft im Vordergrund und
+liefert auf Port `8080` eine Webseite an alle Geräte im selben LAN. Auf dem Fernseher
+stehen Adresse, Live-Status, Log und Installationsfortschritt; am Handy oder PS5-Browser
+wird die PKG ausgewählt und mit der vierstelligen PIN hochgeladen. Die PS4 prüft die
+Datei selbst und übergibt sie an BGFT – ein PC ist nicht beteiligt.
+
+### Screenshots
+
+<table>
+  <tr>
+    <td align="center" width="33%"><img src="docs/ps4-ui-log-preview.png" width="360" alt="Log-Reiter"><br><sub><b>Log</b> – letzte HTTP-Anfragen</sub></td>
+    <td align="center" width="33%"><img src="docs/ps4-ui-net-preview.png" width="360" alt="Netz-Reiter"><br><sub><b>Netz</b> – Adresse, Port und Clients</sub></td>
+    <td align="center" width="33%"><img src="docs/ps4-ui-install-preview.png" width="360" alt="Install-Reiter"><br><sub><b>Install</b> – Upload, PIN und BGFT-Fortschritt</sub></td>
+  </tr>
+</table>
+
+### Was die App kann
+
+- **Vier Reiter auf dem TV:** Status, Log, Netz und Install – bedienbar mit dem Controller.
+- **Upload vom Handy:** Die PKG wird in 64-KiB-Stücken direkt nach `/data/ps4upload/` gestreamt, ohne sie komplett in den RAM zu legen.
+- **PIN-Schutz:** Die PIN steht nur auf dem Fernseher und wird serverseitig geprüft; nach fünf Fehlversuchen ist der Upload eine Minute gesperrt.
+- **Prüfung vor BGFT:** Magic `7F 43 4E 54`, Header-Größe, Eintragstabelle und `param.sfo` (Titel, Title-ID, Content-ID, `APP_VER`).
+- **Installation mit Fortschritt:** BGFT-Task mit Live-Anzeige im INSTALL-Reiter und im Kernel-Log.
+- **Update-Karte:** Prüft den GitHub-Release, vergleicht mit `/status` und schickt die neue PKG über denselben Upload-Weg. Gleiche oder ältere Versionen werden mit HTTP 409 abgewiesen.
+- **Kein Streaming, kein Capture:** Die App macht genau Upload und Installation – sonst nichts.
+
+Wie die PKG gebaut und reproduzierbar geprüft wird, steht unter
+[PS4-PKG bauen und verifizieren](#ps4-pkg-bauen-und-verifizieren).
+
+## Installieren und aktualisieren
+
+1. Den [neuesten Release](https://github.com/xsensenmannx/PS4Upload.pkg/releases/latest) öffnen und `PS4Upload-Direkt-BREW00090.pkg` herunterladen.
+2. Die PKG auf der PS4 installieren (GoldHEN/HEN; es ist ein unsigniertes Fake-PKG).
+3. App starten und die angezeigte Adresse `http://<PS4-IP>:8080` auf Handy, PS5 oder PC öffnen.
+4. PKG auswählen, die PIN vom Fernseher eingeben und hochladen.
+
+Ab **0.5.2** übernimmt die Update-Karte auf der Seite den Weg zur nächsten Version.
+Wer noch die veröffentlichte **0.5.1** installiert hat, spielt die aktuelle PKG einmal
+manuell ein – diese Version hatte die Update-Karte noch nicht.
+
+> **BGFT-Hinweis:** Auf Retail-Firmware prüft BGFT die Paketsignatur. Ob eine selbstgebaute,
+> unsignierte PKG angenommen wird, ist weiterhin ungetestet; Stufe und Rückgabecode stehen
+> im Kernel-Log.
+
+## PC-Tool: `ps4upload.py`
+
+Zusätzlich liegt ein PC-Tool bei, das `.pkg`-Dateien an eine jailbreakte PS4 schickt und
+dort die Installation startet. Die PS4 lädt das Paket über HTTP von diesem Rechner; der
+integrierte Server beherrscht HTTP-Range-Requests, die der PS4-Installer zwingend braucht.
 
 Das ist der erste, lauffähige PS4-Stand auf Basis der Idee von
 [phantomptr/ps5upload](https://github.com/phantomptr/ps5upload). ps5upload selbst ist ein
 PS5-Projekt (PS5-Payload, AVA1-Protokoll); sein Payload läuft nicht auf der PS4. Dieser
 Stand nutzt stattdessen die auf der PS4 verbreitete Remote-Package-Installer-API.
 
-## Voraussetzungen
+## Voraussetzungen für das PC-Tool
 
 - Python 3.10 oder neuer (nur Standardbibliothek, keine Installation nötig)
 - PS4 mit Jailbreak und einem Installationsdienst:
@@ -21,7 +92,7 @@ Stand nutzt stattdessen die auf der PS4 verbreitete Remote-Package-Installer-API
   Im GoldHEN-Modus zusätzlich die Rückverbindung der Payload erlauben
 - PS4-PKG-Dateien (Header `7F 43 4E 54`), auch geteilte Pakete (`_0.pkg`, `_1.pkg`, ...)
 
-## Start
+## PC-Tool starten
 
 ```bash
 python ps4upload.py
@@ -51,7 +122,7 @@ python ps4upload.py --console 192.168.0.50 "D:\Spiele\CUSA00000.pkg"
 | `--goldhen-payload DATEI` | eigene Installer-Payload (`.bin`) statt der mitgelieferten |
 | `--no-browser` | Browser nicht automatisch öffnen |
 
-## Netzwerk auswählen
+## Netzwerk auswählen (PC-Tool)
 
 Standardmäßig nimmt PS4Upload die IP der Standardroute. Bei mehreren Adaptern (WLAN,
 Ethernet, VPN) im Fenster unter **PC-Netzwerk** das Netz wählen, in dem die PS4 hängt –
@@ -65,7 +136,7 @@ Auf der Konsole zeigt `python ps4upload.py --list-networks` alle Kandidaten:
 10.0.0.5        /24 Ethernet
 ```
 
-## GoldHEN statt Remote Package Installer
+## GoldHEN statt Remote Package Installer (PC-Tool)
 
 PS4Upload kann die Installation über GoldHENs **BinLoader** (Port 9090) anstoßen,
 ohne dass auf der PS4 der Remote Package Installer laufen muss.
@@ -97,7 +168,7 @@ Sie wird unverändert weitergegeben; mit `--goldhen-payload` lässt sich eine ei
 - Das Senden eines Payloads führt Code auf der Konsole aus. Nur auf eigenem,
   jailbreakten Gerät und auf eigenes Risiko verwenden.
 
-## Was es kann
+## Was das PC-Tool kann
 
 - Netzwerkauswahl: WLAN, Ethernet oder VPN wählen; automatisch das Netz, in dem die PS4 hängt
 - Installation wahlweise über Remote Package Installer oder GoldHEN-BinLoader
@@ -109,7 +180,7 @@ Sie wird unverändert weitergegeben; mit `--goldhen-payload` lässt sich eine ei
 - Web-Oberfläche auf Deutsch, keine externen Abhängigkeiten
 - API-/UI-Zugriff nur von localhost; im LAN nur PKG-Downloads
 
-## Grenzen
+## Grenzen des PC-Tools
 
 - Kein 1:1-Port von ps5upload: kein eigener PS4-Payload (nur die gebündelte
   GoldHEN-Installer-Payload), keine Dateiverwaltung/FTP, keine Spiele-Dumps oder Cheats.
@@ -139,7 +210,7 @@ Simulation macht diese Grenze sichtbar. Die technische Einordnung und die
 offenen Hardware-Gates stehen in
 [`docs/PS5-HOMEBREW-PKG-FEASIBILITY.md`](docs/PS5-HOMEBREW-PKG-FEASIBILITY.md).
 
-## PS4-Homebrew-PKG (`ps4app/`)
+## PS4-PKG bauen und verifizieren
 
 `ps4app/` enthaelt eine minimale native PS4-App (C, OpenOrbis-Toolchain).
 `tools/ps4pkg.py` baut daraus ein installierbares Fake-PKG:
