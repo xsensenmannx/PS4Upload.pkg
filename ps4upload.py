@@ -9,10 +9,12 @@ Remote Package Installer API on port 12800.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -53,6 +55,76 @@ def lan_ip() -> str:
         return "127.0.0.1"
     finally:
         s.close()
+
+
+def discover_networks(default_ip: str) -> list[dict]:
+    """Local IPv4 addresses with their adapter names (best effort)."""
+    found: dict[str, dict] = {}
+
+    def add(name: str, ip: str, prefix: int = 24) -> None:
+        if not ip or ip.startswith("127."):
+            return
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            return
+        label = (name or "Netzwerk").strip()
+        entry = found.get(ip)
+        if entry is None:
+            found[ip] = {"name": label, "ip": ip, "prefix": prefix or 24}
+            return
+        placeholders = ("Standard", "Hostname", "Netzwerk")
+        if entry["name"] in placeholders and label not in placeholders:
+            entry["name"] = label
+        if prefix and prefix != 24:
+            entry["prefix"] = prefix
+
+    add("Standard", default_ip)
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            add("Hostname", info[4][0])
+    except OSError:
+        pass
+
+    if os.name == "nt":
+        try:
+            raw = subprocess.run(["ipconfig"], capture_output=True, timeout=6).stdout
+            current = "Netzwerk"
+            for line in raw.decode("oem", "replace").splitlines():
+                stripped = line.strip()
+                if line[:1] not in (" ", "\t") and stripped.endswith(":") and "adapter" in stripped.lower():
+                    current = stripped[:-1]
+                    index = current.lower().find("adapter")
+                    if index >= 0:
+                        current = current[index + len("adapter"):].strip(" :-/") or current
+                elif "IPv4" in line:
+                    match = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
+                    if match:
+                        add(current, match.group(1))
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            completed = subprocess.run(
+                ["ip", "-o", "-4", "addr", "show"], capture_output=True, timeout=4, text=True
+            )
+            for line in completed.stdout.splitlines():
+                parts = line.split()
+                if "inet" not in parts:
+                    continue
+                try:
+                    name = parts[1].rstrip(":")
+                    address = parts[parts.index("inet") + 1].split("/")[0]
+                except (IndexError, ValueError):
+                    continue
+                add(name, address)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    ordered = [entry for ip, entry in found.items() if ip == default_ip]
+    ordered += [entry for ip, entry in found.items() if ip != default_ip]
+    return ordered
 
 
 def human_size(n: int) -> str:
@@ -228,7 +300,8 @@ class Job:
 
 class App:
     def __init__(self, host_ip: str, port: int, console_ip: str, console_port: int):
-        self.host_ip = host_ip
+        self.host_ip = host_ip.strip()
+        self.default_ip = lan_ip()
         self.port = port
         self.console_ip = console_ip
         self.console_port = console_port
@@ -241,6 +314,8 @@ class App:
         self.active_id: int | None = None
         self._probe: dict | None = None
         self._probe_at = 0.0
+        self._nets: list[dict] = []
+        self._nets_at = 0.0
 
     # -- logging ---------------------------------------------------------
 
@@ -293,6 +368,74 @@ class App:
         self._probe = None
         self._probe_at = 0.0
         self.log(f"PS4-Adresse: {ip or '(leer)'}")
+
+    # -- network ---------------------------------------------------------
+
+    def network_options(self, refresh: bool = False) -> list[dict]:
+        now = time.time()
+        with self.lock:
+            if not refresh and self._nets and now - self._nets_at < 10.0:
+                return [dict(item) for item in self._nets]
+        nets = discover_networks(self.default_ip)
+        with self.lock:
+            self._nets = nets
+            self._nets_at = now
+        return [dict(item) for item in nets]
+
+    def effective_ip(self) -> str:
+        if self.host_ip:
+            return self.host_ip
+        options = self.network_options()
+        if self.console_ip:
+            try:
+                console = ipaddress.ip_address(self.console_ip)
+            except ValueError:
+                console = None
+            if console is not None:
+                for option in options:
+                    try:
+                        subnet = ipaddress.ip_network(
+                            f"{option['ip']}/{option['prefix']}", strict=False
+                        )
+                    except ValueError:
+                        continue
+                    if console in subnet:
+                        return option["ip"]
+        return options[0]["ip"] if options else self.default_ip
+
+    def network_state(self) -> dict:
+        options = self.network_options()
+        if self.host_ip and not any(item["ip"] == self.host_ip for item in options):
+            options.insert(0, {"name": "Manuell", "ip": self.host_ip, "prefix": 24})
+        effective = self.effective_ip()
+        console_match = None
+        if self.console_ip:
+            try:
+                subnet = ipaddress.ip_network(f"{effective}/24", strict=False)
+                console_match = ipaddress.ip_address(self.console_ip) in subnet
+            except ValueError:
+                console_match = None
+        return {
+            "selected": self.host_ip,
+            "ip": effective,
+            "url": f"http://{effective}:{self.port}",
+            "console_match": console_match,
+            "options": [
+                {**item, "url": f"http://{item['ip']}:{self.port}"} for item in options
+            ],
+        }
+
+    def set_network(self, ip: str) -> None:
+        ip = ip.strip()
+        if ip:
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                raise ValueError("Ungueltige IP-Adresse.") from None
+            if not any(item["ip"] == ip for item in self.network_options(refresh=True)):
+                raise ValueError("Netzwerk nicht gefunden - bitte die Liste neu laden.")
+        self.host_ip = ip
+        self.log(f"PC-Netzwerk: {ip or 'automatisch'}")
 
     def ps4_post(self, path: str, payload: dict, timeout: float = 15.0) -> dict:
         if not self.console_ip:
@@ -444,7 +587,8 @@ class App:
 
     def _pkg_url(self, job: Job, index: int) -> str:
         name = urllib.parse.quote(job.files[index].name)
-        return f"http://{self.host_ip}:{self.port}/pkg/{job.id}/{index}/{name}"
+        host = self.effective_ip()
+        return f"http://{host}:{self.port}/pkg/{job.id}/{index}/{name}"
 
     def _fail(self, job: Job, message: str) -> None:
         job.state = "error"
@@ -573,13 +717,15 @@ class App:
             jobs = [self.jobs[i].to_dict() for i in sorted(self.jobs)]
             logs = list(self.logs[-80:])
             active = self.active_id
+        network = self.network_state()
         return {
             "version": VERSION,
             "server": {
-                "url": f"http://{self.host_ip}:{self.port}",
-                "ip": self.host_ip,
+                "url": network["url"],
+                "ip": network["ip"],
                 "port": self.port,
             },
+            "network": network,
             "console": self.console_info(),
             "active": active,
             "jobs": jobs,
@@ -680,6 +826,15 @@ class Handler(BaseHTTPRequestHandler):
                 ip = str(body.get("ip") or "").strip()
                 self.app.set_console(ip)
                 self._send_json({"ok": True, "console": self.app.console_info()})
+                return
+
+            if path == "/api/network":
+                try:
+                    self.app.set_network(str(body.get("ip") or ""))
+                except ValueError as exc:
+                    self._send_error_json(str(exc), 400)
+                    return
+                self._send_json({"ok": True, "network": self.app.network_state()})
                 return
 
             if path == "/api/add":
@@ -861,6 +1016,13 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .job-actions{display:flex;gap:8px;flex-wrap:wrap}
 .msg{font-size:12.5px;color:var(--muted)}
 .msg.error{color:#ff9c9c}
+select{
+  background:#0a1119;border:1px solid var(--line);color:var(--text);border-radius:10px;
+  padding:9px 11px;font:13.5px/1.4 ui-monospace,monospace;outline:none;max-width:100%;
+}
+select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(77,157,255,.15)}
+.net{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px}
+.net code{font:12px ui-monospace,monospace;color:#9fc3ea;background:#0a1119;border:1px solid var(--line);padding:5px 8px;border-radius:7px;overflow-wrap:anywhere}
 pre#log{
   margin:0;max-height:240px;overflow:auto;background:#080d13;border:1px solid var(--line);
   border-radius:10px;padding:12px;font:12px/1.6 ui-monospace,monospace;color:#9fb3c9;white-space:pre-wrap;
@@ -875,6 +1037,8 @@ pre#log{
 @media (max-width:560px){
   header{padding-top:20px}
   .row{flex-direction:column}
+  .net{align-items:stretch}
+  select{width:100%}
   button{width:100%}
 }
 </style>
@@ -898,12 +1062,17 @@ pre#log{
       <button class="primary" type="submit">Verbinden</button>
     </form>
     <p id="consoleText" class="muted small" style="margin:10px 0 0">Remote Package Installer auf der PS4 starten, dann die IP eintragen.</p>
+    <div class="net">
+      <span class="muted small">PC-Netzwerk</span>
+      <select id="networkSelect" aria-label="Netzwerk fuer die PS4 waehlen"></select>
+      <code id="serverUrl"></code>
+    </div>
+    <p id="networkHint" class="muted small" style="margin:8px 0 0"></p>
   </section>
 
   <section class="card">
     <div class="card-head">
       <h2>Warteschlange</h2>
-      <span id="serverUrl" class="muted small"></span>
     </div>
     <form id="addForm" class="row">
       <input id="pathInput" placeholder="D:\Spiele\spiel.pkg oder Ordner" spellcheck="false" autocomplete="off">
@@ -1009,6 +1178,30 @@ function jobCard(job){
     + '</div>';
 }
 
+function renderNetwork(state){
+  const net = state.network || {};
+  const select = $("#networkSelect");
+  const auto = "Automatisch" + (net.ip ? " (" + net.ip + ")" : "");
+  const options = [{name:auto, ip:""}].concat(net.options || []);
+  const signature = options.map((o) => o.ip + "|" + o.name).join(",");
+  if (select.dataset.signature !== signature){
+    select.innerHTML = options.map((o) => {
+      const label = o.ip ? (o.name && o.name !== "Standard" ? o.name + " - " + o.ip : o.ip) : o.name;
+      return '<option value="' + esc(o.ip) + '">' + esc(label) + '</option>';
+    }).join("");
+    select.dataset.signature = signature;
+  }
+  if (document.activeElement !== select) select.value = net.selected || "";
+  $("#serverUrl").textContent = net.url || "";
+  const hint = $("#networkHint");
+  if (net.console_match === false){
+    hint.textContent = "PS4 und PC sind nicht im selben /24-Netz - bitte das passende Netzwerk waehlen.";
+    hint.style.color = "var(--warn)";
+  } else {
+    hint.textContent = "";
+  }
+}
+
 function render(state){
   const dot = $("#dot");
   const text = $("#consoleText");
@@ -1026,7 +1219,7 @@ function render(state){
   const ipInput = $("#ipInput");
   if (document.activeElement !== ipInput) ipInput.value = consoleInfo.ip || "";
 
-  $("#serverUrl").textContent = (state.server && state.server.url) ? state.server.url : "";
+  renderNetwork(state);
 
   const jobs = state.jobs || [];
   $("#jobs").innerHTML = jobs.length
@@ -1070,6 +1263,13 @@ $("#addForm").addEventListener("submit", async (event) => {
   } catch (error){ toast(error.message); }
 });
 
+$("#networkSelect").addEventListener("change", async (event) => {
+  try {
+    await api("/api/network", {ip: event.target.value});
+    toast("Netzwerk gespeichert");
+  } catch (error){ toast(error.message); }
+});
+
 $("#jobs").addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-act]");
   if (!button) return;
@@ -1104,13 +1304,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=9898, help="HTTP-Port fuer die PS4 (Standard: 9898)")
     parser.add_argument("--host", default="0.0.0.0", help="Bind-Adresse (Standard: 0.0.0.0)")
     parser.add_argument("--host-ip", default="", help="IP dieses PCs, wie die PS4 ihn sieht")
+    parser.add_argument("--list-networks", action="store_true", help="Lokale IPv4-Netzwerke anzeigen und beenden")
     parser.add_argument("--console", default="", help="IP der PS4")
     parser.add_argument("--console-port", type=int, default=RPI_PORT, help="RPI-Port der PS4 (Standard: 12800)")
     parser.add_argument("--no-browser", action="store_true", help="Browser nicht automatisch oeffnen")
     args = parser.parse_args(argv)
 
-    host_ip = args.host_ip.strip() or lan_ip()
-    app = App(host_ip=host_ip, port=args.port, console_ip=args.console.strip(), console_port=args.console_port)
+    if args.list_networks:
+        for option in discover_networks(lan_ip()):
+            print(f"{option['ip']:15} /{option['prefix']:<2} {option['name']}")
+        return 0
+
+    app = App(
+        host_ip=args.host_ip,
+        port=args.port,
+        console_ip=args.console.strip(),
+        console_port=args.console_port,
+    )
 
     try:
         httpd = ThreadingHTTPServer((args.host, args.port), Handler)
@@ -1131,7 +1341,7 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print(f"{APP_NAME} {VERSION}")
     print(f"Browser:  http://127.0.0.1:{args.port}")
-    print(f"Fuer PS4: http://{host_ip}:{args.port}")
+    print(f"Fuer PS4: http://{app.effective_ip()}:{args.port}")
     print("Die PS4 muss diese Adresse im LAN erreichen koennen (Firewall!).")
     if app.console_ip:
         print(f"PS4:      {app.console_ip}:{app.console_port}")

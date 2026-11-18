@@ -39,13 +39,29 @@ python ps4upload.py --console 192.168.0.50 "D:\Spiele\CUSA00000.pkg"
 | Option | Bedeutung |
 |---|---|
 | `--port 9898` | HTTP-Port, auf dem die PKGs für die PS4 bereitliegen |
-| `--host-ip 192.168.0.11` | IP dieses PCs, falls die automatische Erkennung nicht passt |
+| `--host-ip 192.168.0.11` | IP dieses PCs fest vorgeben (überspringt die Netzwerkauswahl) |
+| `--list-networks` | Lokale IPv4-Adressen und Adapter anzeigen und beenden |
 | `--console 192.168.0.50` | IP der PS4 (sonst im Browser eintragen) |
 | `--console-port 12800` | Port des Remote Package Installers |
 | `--no-browser` | Browser nicht automatisch öffnen |
 
+## Netzwerk auswählen
+
+Standardmäßig nimmt PS4Upload die IP der Standardroute. Bei mehreren Adaptern (WLAN,
+Ethernet, VPN) im Fenster unter **PC-Netzwerk** das Netz wählen, in dem die PS4 hängt –
+die angezeigte URL ist die, die die PS4 tatsächlich lädt. Ist eine PS4-IP eingetragen und
+steht sie in einem anderen /24-Netz, erscheint ein Hinweis.
+
+Auf der Konsole zeigt `python ps4upload.py --list-networks` alle Kandidaten:
+
+```text
+192.168.0.11    /24 WLAN
+10.0.0.5        /24 Ethernet
+```
+
 ## Was es kann
 
+- Netzwerkauswahl: WLAN, Ethernet oder VPN wählen; automatisch das Netz, in dem die PS4 hängt
 - PKG-Dateien und ganze Ordner hinzufügen; geteilte Pakete werden als ein Auftrag erkannt
 - HTTP-Server mit Range-Support (206/416), damit die PS4 Metadaten und Teile lesen kann
 - Installationsauftrag über `POST /api/install` (Typ `direct`, mehrere Teile in Reihenfolge)
