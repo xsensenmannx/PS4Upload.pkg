@@ -25,6 +25,8 @@ import tarfile
 import urllib.request
 from pathlib import Path
 
+import version as version_source
+
 ROOT = Path(__file__).resolve().parent.parent
 APP_DIR = ROOT / "ps4app"
 SDK_DIR = ROOT / "ps4sdk"
@@ -35,7 +37,6 @@ DEFAULT_OUT = ROOT / "dist"
 TITLE = "PS4Upload Direkt"
 TITLE_ID = "BREW00090"
 CONTENT_ID = "IV0000-BREW00090_00-PS4UPLOAD0000000"
-APP_VER = "01.00"
 CATEGORY = "gd"
 PAID = "0x3800000000000011"
 PKG_NAME = f"PS4Upload-Direkt-{TITLE_ID}.pkg"
@@ -47,22 +48,32 @@ TOOLCHAIN_URL = (
 TOOLCHAIN_SHA256 = "3c7cd5bb593ca74fa1c13fd59f3938dc0fc07985167f7275063019e63abe4526"
 TOOLCHAIN_ARCHIVE = ROOT / ".tmp" / "toolchain-llvm-18.tar.gz"
 
-SFO_KEYS = [
-    ("APP_TYPE", "Integer", 4, "1"),
-    ("APP_VER", "Utf8", 8, APP_VER),
-    ("ATTRIBUTE", "Integer", 4, "0"),
-    ("CATEGORY", "Utf8", 4, CATEGORY),
-    ("CONTENT_ID", "Utf8", 48, CONTENT_ID),
-    ("DOWNLOAD_DATA_SIZE", "Integer", 4, "0"),
-    ("SYSTEM_VER", "Integer", 4, "0"),
-    ("TITLE", "Utf8", 128, TITLE),
-    ("TITLE_ID", "Utf8", 12, TITLE_ID),
-    ("VERSION", "Utf8", 8, APP_VER),
-]
-
-
 class BuildError(RuntimeError):
     pass
+
+
+def current_version() -> tuple[int, int, int]:
+    try:
+        return version_source.read_version()
+    except version_source.VersionError as exc:
+        raise BuildError(str(exc)) from exc
+
+
+def sfo_entries() -> list[tuple[str, str, int, str]]:
+    """SFO-Eintraege; APP_VER und VERSION kommen aus version.txt."""
+    app_ver = version_source.format_app_ver(current_version())
+    return [
+        ("APP_TYPE", "Integer", 4, "1"),
+        ("APP_VER", "Utf8", 8, app_ver),
+        ("ATTRIBUTE", "Integer", 4, "0"),
+        ("CATEGORY", "Utf8", 4, CATEGORY),
+        ("CONTENT_ID", "Utf8", 48, CONTENT_ID),
+        ("DOWNLOAD_DATA_SIZE", "Integer", 4, "0"),
+        ("SYSTEM_VER", "Integer", 4, "0"),
+        ("TITLE", "Utf8", 128, TITLE),
+        ("TITLE_ID", "Utf8", 12, TITLE_ID),
+        ("VERSION", "Utf8", 8, app_ver),
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -175,6 +186,15 @@ def build(out_dir: Path) -> Path:
     require_sdk()
     zig = find_zig()
 
+    parts = current_version()
+    if version_source.sync():
+        print("version.h aus version.txt neu erzeugt")
+    print(
+        f"Version {version_source.format_version(parts)} "
+        f"(APP_VER {version_source.format_app_ver(parts)}, "
+        f"Tag {version_source.format_tag(parts)})"
+    )
+
     sources_c = sorted(APP_DIR.glob("*.c")) + sorted((APP_DIR / "vendor").glob("*.c"))
     sources_cpp = sorted(APP_DIR.glob("*.cpp")) + sorted((APP_DIR / "vendor").glob("*.cpp"))
     if not sources_c and not sources_cpp:
@@ -237,7 +257,7 @@ def build(out_dir: Path) -> Path:
     print("4/6 param.sfo schreiben")
     sfo = pkgroot / "sce_sys" / "param.sfo"
     pkgtool("sfo_new", str(sfo))
-    for key, kind, maxsize, value in SFO_KEYS:
+    for key, kind, maxsize, value in sfo_entries():
         pkgtool(
             "sfo_setentry", str(sfo), key,
             "--type", kind, "--maxsize", str(maxsize), "--value", value,
@@ -299,9 +319,15 @@ def parse_sfo(data: bytes) -> dict[str, object]:
 def verify(pkg_path: Path) -> bool:
     data = pkg_path.read_bytes()
     problems: list[str] = []
+    parts = current_version()
+    expected_app_ver = version_source.format_app_ver(parts)
 
     print(f"Datei:        {pkg_path} ({len(data)} Bytes)")
     print(f"SHA-256:      {hashlib.sha256(data).hexdigest()}")
+    print(
+        f"Version:      {version_source.format_version(parts)} "
+        f"(APP_VER {expected_app_ver})"
+    )
 
     if data[:4] != b"\x7fCNT":
         problems.append(f"PKG-Signatur fehlt (gefunden: {data[:4]!r})")
@@ -351,12 +377,20 @@ def verify(pkg_path: Path) -> bool:
         offset, size = entries[0x1000]
         sfo = parse_sfo(data[offset:offset + size])
         print("param.sfo:")
-        for key in ("TITLE", "TITLE_ID", "CONTENT_ID", "CATEGORY", "APP_VER"):
+        for key in ("TITLE", "TITLE_ID", "CONTENT_ID", "CATEGORY", "APP_VER", "VERSION"):
             print(f"  {key:<11} {sfo.get(key)}")
         if sfo.get("CONTENT_ID") != CONTENT_ID:
             problems.append("CONTENT_ID in param.sfo weicht ab")
         if sfo.get("TITLE_ID") != TITLE_ID:
             problems.append("TITLE_ID in param.sfo weicht ab")
+        if sfo.get("APP_VER") != expected_app_ver:
+            problems.append(
+                f"APP_VER {sfo.get('APP_VER')!r} != {expected_app_ver} aus version.txt"
+            )
+        if sfo.get("VERSION") != expected_app_ver:
+            problems.append(
+                f"VERSION {sfo.get('VERSION')!r} != {expected_app_ver} aus version.txt"
+            )
 
     if problems:
         for problem in problems:
@@ -373,6 +407,18 @@ def verify(pkg_path: Path) -> bool:
 
 
 def check() -> int:
+    try:
+        parts = current_version()
+        print(
+            f"Version: {version_source.format_version(parts)} "
+            f"(APP_VER {version_source.format_app_ver(parts)}, "
+            f"Tag {version_source.format_tag(parts)})"
+        )
+        header_problems = version_source.check()
+        print(f"version.h: {'OK' if not header_problems else header_problems[0]}")
+    except BuildError as exc:
+        print(f"Version: FEHLT - {exc}")
+
     zig = None
     try:
         zig = find_zig()

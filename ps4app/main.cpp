@@ -346,7 +346,7 @@ static void send_json(int fd)
     int total = 0;
 
     used = ui_append_text(body, sizeof(body), used,
-        "{\"ok\":true,\"app\":\"ps4upload-direct\",\"version\":\"0.5.0\","
+        "{\"ok\":true,\"app\":\"ps4upload-direct\",\"version\":\"" APP_VERSION "\","
         "\"address\":\"");
     used = ui_append_text(body, sizeof(body), used, g_local_ip);
     used = ui_append_text(body, sizeof(body), used, "\",\"port\":8080,\"requests\":");

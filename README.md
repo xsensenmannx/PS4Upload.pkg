@@ -151,6 +151,11 @@ python tools/ps4pkg.py build         # -> dist/PS4Upload-Direkt-BREW00090.pkg
 python tools/ps4pkg.py verify dist/PS4Upload-Direkt-BREW00090.pkg
 ```
 
+Die Version steht in [`version.txt`](version.txt). `tools/version.py sync`
+erzeugt daraus `ps4app/version.h` fuer die UI, der Build schreibt dieselbe
+Version als `APP_VER` in `param.sfo`, und der Release-Tag ist `v<version>`
+(`python tools/version.py tag`).
+
 Die Kette ist ELF -> FSELF (`create-fself`) -> `param.sfo`/`.gp4` -> fPKG
 (`PkgTool` aus LibOrbisPkg). Das Paket ist **kein** Sony-signiertes PKG: es hat
 Passcode 0 und braucht eine jailbreakte PS4 mit GoldHEN/HEN. Senden laesst es

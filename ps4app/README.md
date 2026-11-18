@@ -138,6 +138,21 @@ python tools/ps4pkg.py build
 
 Ergebnis: `dist/PS4Upload-Direkt-BREW00090.pkg`.
 
+## Versionierung
+
+`version.txt` im Repo-Wurzelverzeichnis ist die einzige Quelle:
+
+- `python tools/version.py sync` schreibt `ps4app/version.h`; die UI zeigt
+  daraus `APP_VERSION` unten rechts
+- `python tools/ps4pkg.py build` uebernimmt dieselbe Version als `APP_VER`
+  und `VERSION` in `param.sfo`
+- `python tools/version.py tag` gibt den Release-Tag aus (`v0.5.1`)
+
+`APP_VER` hat das PS4-Format `MM.mm` mit `MM = MAJOR*10 + MINOR` und
+`mm = PATCH`: `0.5.1` wird zu `05.01`. Die Abbildung ist monoton, solange
+`MINOR < 10` und `PATCH < 100` bleiben. `verify` meldet einen Fehler, wenn
+Paket und `version.txt` auseinanderlaufen.
+
 ## Auf der Konsole
 
 1. Paket installieren (GoldHEN/HEN vorausgesetzt), z. B. mit PS4Upload.

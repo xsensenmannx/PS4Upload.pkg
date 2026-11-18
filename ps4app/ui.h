@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "stb_easy_font.h"
+#include "version.h"
 
 #define UI_WIDTH 1920
 #define UI_HEIGHT 1080
@@ -496,5 +497,5 @@ static void ui_draw(Canvas &canvas, const UiState &state)
     }
 
     ui_draw_text(canvas, 92, 1000, 2.1f, muted, "< > REITER        ^ v SCROLLEN        PS-TASTE: ZURUECK ZUM MENUE");
-    ui_draw_text_right(canvas, 1830, 1000, 2.0f, muted, "0.5.0 - BREW00090");
+    ui_draw_text_right(canvas, 1830, 1000, 2.0f, muted, APP_VERSION " - BREW00090");
 }
