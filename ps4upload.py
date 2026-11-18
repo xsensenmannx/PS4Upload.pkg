@@ -247,6 +247,21 @@ def parse_range(header: str | None, size: int):
     return start, min(end, size - 1)
 
 
+def is_loopback(host: str) -> bool:
+    try:
+        address = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address.is_loopback
+
+
+def allowed_for(host: str, path: str) -> bool:
+    """Loopback may use UI and API; other clients only fetch package bytes."""
+    return is_loopback(host) or path.startswith("/pkg/")
+
+
 # ----------------------------------------------------------------------------- app
 
 
@@ -768,6 +783,13 @@ class Handler(BaseHTTPRequestHandler):
     def _send_error_json(self, message: str, status: int) -> None:
         self._send_json({"error": message}, status)
 
+    def _deny_remote(self, path: str) -> None:
+        message = "Zugriff nur lokal. Im LAN sind nur /pkg/...-Downloads erlaubt."
+        if path.startswith("/api"):
+            self._send_error_json(message, 403)
+        else:
+            self._send_bytes(message.encode("utf-8"), "text/plain; charset=utf-8", 403)
+
     # -- parsing ---------------------------------------------------------
 
     def _read_json(self):
@@ -791,6 +813,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - stdlib naming
         try:
             path = urllib.parse.urlsplit(self.path).path
+            if not allowed_for(str(self.client_address[0]), path):
+                self._deny_remote(path)
+                return
             if path == "/":
                 self._send_bytes(PAGE.encode("utf-8"), "text/html; charset=utf-8")
             elif path == "/api/state":
@@ -817,6 +842,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - stdlib naming
         try:
             path = urllib.parse.urlsplit(self.path).path
+            if not is_loopback(str(self.client_address[0])):
+                self._deny_remote(path)
+                return
             body = self._read_json()
             if body is None:
                 self._send_error_json("Ungueltiges JSON", 400)
@@ -1343,6 +1371,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Browser:  http://127.0.0.1:{args.port}")
     print(f"Fuer PS4: http://{app.effective_ip()}:{args.port}")
     print("Die PS4 muss diese Adresse im LAN erreichen koennen (Firewall!).")
+    print("Web-UI/API nur lokal; im LAN sind nur /pkg/...-Downloads erlaubt.")
     if app.console_ip:
         print(f"PS4:      {app.console_ip}:{app.console_port}")
     else:

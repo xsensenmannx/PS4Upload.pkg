@@ -68,6 +68,7 @@ Auf der Konsole zeigt `python ps4upload.py --list-networks` alle Kandidaten:
 - Fortschritt, Geschwindigkeit und Restzeit über `POST /api/get_task_progress`
 - Warteschlange: PS4-Installationen laufen nacheinander, Stoppen und erneuter Versuch möglich
 - Web-Oberfläche auf Deutsch, keine externen Abhängigkeiten
+- API-/UI-Zugriff nur von localhost; im LAN nur PKG-Downloads
 
 ## Grenzen
 
@@ -76,8 +77,9 @@ Auf der Konsole zeigt `python ps4upload.py --list-networks` alle Kandidaten:
 - Die PS4 braucht einen RPI-kompatiblen Dienst auf Port `12800`. GoldHEN allein reicht nicht,
   solange dort kein RPI mitläuft.
 - PS5 wird nicht unterstützt (dafür ist das Original gedacht).
-- Nur vertrauenswürdiges LAN: Die Web-API hat keine Anmeldung und kann lokale Pfade lesen,
-  die als PKG hinzugefügt werden.
+- **Web-UI und `/api` sind nur über localhost erreichbar.** Im LAN liefert der Server
+  ausschließlich `/pkg/...` aus, damit die PS4 laden kann. Wer die Oberfläche von einem
+  anderen Gerät braucht, muss sie über einen lokalen Tunnel/Proxy auf dem PC öffnen.
 
 ## Lizenz
 
