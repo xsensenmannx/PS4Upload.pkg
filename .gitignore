@@ -9,3 +9,5 @@ upstream-ps5upload/
 build/
 dist/
 *.spec
+ps4sdk/
+ps4app/build/

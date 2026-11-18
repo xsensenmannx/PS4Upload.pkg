@@ -122,6 +122,63 @@ Sie wird unverändert weitergegeben; mit `--goldhen-payload` lässt sich eine ei
   ausschließlich `/pkg/...` aus, damit die PS4 laden kann. Wer die Oberfläche von einem
   anderen Gerät braucht, muss sie über einen lokalen Tunnel/Proxy auf dem PC öffnen.
 
+## PS5 Companion (separates MVP 0)
+
+Unter [`ps5companion/`](ps5companion/README.md) liegt eine eigenständige,
+browserbasierte Steuerungsebene für ein PS5-Play-Together-Setup im LAN:
+Session starten, Einladung per Code/QR teilen, Gäste als Player 2–4 zulassen,
+Bereitschaft und Controller-Input in der Lobby sehen.
+
+```bash
+python run_ps5companion.py
+```
+
+Das ist **keine PS5-PKG und kein Streaming-Host**. Capture, Video/Audio und
+virtuelle Controller auf der Konsole sind noch nicht implementiert; die
+Simulation macht diese Grenze sichtbar. Die technische Einordnung und die
+offenen Hardware-Gates stehen in
+[`docs/PS5-HOMEBREW-PKG-FEASIBILITY.md`](docs/PS5-HOMEBREW-PKG-FEASIBILITY.md).
+
+## PS4-Homebrew-PKG (`ps4app/`)
+
+`ps4app/` enthaelt eine minimale native PS4-App (C, OpenOrbis-Toolchain).
+`tools/ps4pkg.py` baut daraus ein installierbares Fake-PKG:
+
+```bash
+python -m pip install ziglang        # clang/lld fuer die PS4-Zielplattform
+python tools/ps4pkg.py fetch-sdk     # OpenOrbis-Toolchain (~150 MB) nach ps4sdk/
+python tools/ps4pkg.py build         # -> dist/PS4Upload-Direkt-BREW00090.pkg
+python tools/ps4pkg.py verify dist/PS4Upload-Direkt-BREW00090.pkg
+```
+
+Die Kette ist ELF -> FSELF (`create-fself`) -> `param.sfo`/`.gp4` -> fPKG
+(`PkgTool` aus LibOrbisPkg). Das Paket ist **kein** Sony-signiertes PKG: es hat
+Passcode 0 und braucht eine jailbreakte PS4 mit GoldHEN/HEN. Senden laesst es
+sich zum Beispiel mit PS4Upload selbst.
+
+Inhalt der App: Beim Start erscheint **auf dem Fernseher** eine Oberflaeche
+(CPU-Framebuffer ueber `libSceVideoOut`) mit der LAN-Adresse und dem Live-Status.
+Gleichzeitig liefert die PS4 auf Port 8080 eine Web-Seite an PS5, Handy oder PC
+im selben LAN/WLAN - ein PC ist nicht beteiligt.
+
+Die App bleibt bewusst im Vordergrund: Eine PS4-App, die in den Hintergrund
+wandert (etwa weil der PS4-Browser geoeffnet wird), wird vom System pausiert und
+hat kein Netzwerk mehr - genau deshalb ist ps5upload ein Payload. Diese App
+zeigt ihre Oberflaeche daher selbst an, statt den Browser zu benutzen.
+
+Die Seite nimmt inzwischen auch eine PKG an: Der Datei-Body wird nach
+`/data/ps4upload/` gestreamt, vor der Installation geprueft (Magic, Groesse,
+`param.sfo`) und ueber BGFT installiert. Vor dem Upload muss die vierstellige
+PIN eingegeben werden, die auf dem Fernseher steht; falsche Versuche erscheinen
+im INSTALL-Reiter und im Kernel-Log, nach fuenf Fehlversuchen ist der Upload
+eine Minute gesperrt. Der INSTALL-Reiter auf dem Fernseher
+zeigt Upload- und Installationsfortschritt. Ob BGFT eine selbstgebaute,
+unsignierte PKG auf Retail-Firmware annimmt, ist ungetestet.
+
+Streaming, Spielsteuerung und Capture sind nicht enthalten. Der Build ist auf
+dem PC verifiziert (Kompilierung, Link, PKG-Struktur, PKG-Parser, gerenderte
+Oberflaeche); der Lauf auf einer PS4 ist nicht getestet.
+
 ## Lizenz
 
 GPL-3.0, siehe [LICENSE](LICENSE). Inspiriert von ps5upload (GPL-3.0) und der
