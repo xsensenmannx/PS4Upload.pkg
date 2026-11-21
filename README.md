@@ -45,8 +45,8 @@ Datei selbst und übergibt sie an BGFT – ein PC ist nicht beteiligt.
 
 - **Vier Reiter auf dem TV:** Status, Log, Netz und Install – bedienbar mit dem Controller.
 - **Upload vom Handy:** Die PKG wird in 64-KiB-Stücken direkt nach `/data/ps4upload/` gestreamt, ohne sie komplett in den RAM zu legen.
-- **PIN-Schutz:** Die PIN steht nur auf dem Fernseher und wird serverseitig geprüft; nach fünf Fehlversuchen ist der Upload eine Minute gesperrt.
-- **Prüfung vor BGFT:** Magic `7F 43 4E 54`, Header-Größe, Eintragstabelle und `param.sfo` (Titel, Title-ID, Content-ID, `APP_VER`).
+- **PIN-Schutz:** Die PIN steht nur auf dem Fernseher und wird im Header `X-Upload-Pin` übertragen; nach fünf Fehlversuchen ist nur dieser Client eine Minute gesperrt.
+- **Prüfung vor BGFT:** Magic `7F 43 4E 54`, Header-Größe, Eintragstabelle und `param.sfo` mit strikten Formaten für `APP_VER`, `TITLE_ID` und `CONTENT_ID`; manipulierte Felder werden mit HTTP 400 abgewiesen.
 - **Installation mit Fortschritt:** BGFT-Task mit Live-Anzeige im INSTALL-Reiter und im Kernel-Log.
 - **Update-Karte:** Prüft den GitHub-Release, vergleicht mit `/status` und schickt die neue PKG über denselben Upload-Weg. Gleiche oder ältere Versionen werden mit HTTP 409 abgewiesen.
 - **Kein Streaming, kein Capture:** Die App macht genau Upload und Installation – sonst nichts.
@@ -180,6 +180,36 @@ Sie wird unverändert weitergegeben; mit `--goldhen-payload` lässt sich eine ei
 - Web-Oberfläche auf Deutsch, keine externen Abhängigkeiten
 - API-/UI-Zugriff nur von localhost; im LAN nur PKG-Downloads
 
+## PS4 im Browser verwalten: `ps4manage.py`
+
+Zusaetzlich zum Senden von PKGs gibt es einen Verwaltungs-Manager. Er laeuft
+auf dem PC und spricht die Dienste, die GoldHEN ohnehin mitbringt: FTP
+(Port `2121`) und BinLoader (`9090`).
+
+```bash
+python ps4manage.py --console 192.168.0.50
+```
+
+Der Browser oeffnet `http://127.0.0.1:9899`:
+
+| Reiter | Inhalt |
+|---|---|
+| **Spiele** | Installierte Titel aus `/user/appmeta`, Basis/Updates/DLC gruppiert, Icon, Version |
+| **Dateien** | `/`, `/data`, `/user`, `/mnt` (USB): Liste, Download, Upload, Ordner anlegen, Loeschen, Umbenennen |
+| **Cheats** | `/data/GoldHEN/cheats` lesen, hochladen, loeschen (`.json`, `.shn`) |
+| **Payloads** | Payloads aus `payloads/` und `goldhen/` an BinLoader senden; eigene `.bin`/`.elf` direkt senden |
+| **Sicherungen** | Save-Daten je Benutzer und Title-ID als ZIP herunterladen (nur lesen) |
+
+Optionen: `--port 9899` (Oberflaeche), `--ftp-port 2121`,
+`--goldhen-port 9090`, `--rpi-port 12800`, `--no-browser`.
+
+Grenzen: Die Oberflaeche bindet nur an `127.0.0.1`, weil sie Dateien auf der
+Konsole loeschen kann. Geschrieben wird nur unter `/data`, `/user` und `/mnt`.
+Spiele starten/beenden, Deinstallation und Power brauchen einen residenten
+Payload; Streaming/„Play“ gibt es auf der PS4 nicht. Der vollstaendige
+Abgleich mit PS5Upload steht in
+[`docs/PS4-PARITY-PS5UPLOAD.md`](docs/PS4-PARITY-PS5UPLOAD.md).
+
 ## Grenzen des PC-Tools
 
 - Kein 1:1-Port von ps5upload: kein eigener PS4-Payload (nur die gebündelte
@@ -209,6 +239,48 @@ virtuelle Controller auf der Konsole sind noch nicht implementiert; die
 Simulation macht diese Grenze sichtbar. Die technische Einordnung und die
 offenen Hardware-Gates stehen in
 [`docs/PS5-HOMEBREW-PKG-FEASIBILITY.md`](docs/PS5-HOMEBREW-PKG-FEASIBILITY.md).
+
+## PS4-Port von PS5Upload: zwei Projekte
+
+Der Port ist in zwei eigenständige Varianten geteilt, die denselben gepinnten
+Upstream-Quellstand und denselben Payload-Kern nutzen:
+
+- **[Option B – Payload zuerst](ps4port/option-b-payload/README.md):** Upload und
+  Installation im Hintergrund, kleine eigene Web-UI, zuerst umsetzbar.
+- **[Option A – Voller Port](ps4port/option-a-full/README.md):** derselbe Payload plus
+  Bibliothek, Dateien, Start/Stop und Engine-/Client-Anbindung.
+
+Übersicht, Abgrenzung und Upstream-Pin stehen in [`ps4port/`](ps4port/README.md);
+der host-getestete Kern liegt unter [`ps4port/core/`](ps4port/core/README.md).
+
+## PS4-Payload (Anfang des PS5Upload-Pendants)
+
+`payload/ps4/` enthält den nativen PS4-Payload: ein ELF, das aus dem
+host-getesteten Kern in `ps4port/core/` gebaut wird, auf Port `9180` einen
+HTTP-Dienst bereitstellt und PKGs mit PIN nach `/data/ps4upload/` annimmt.
+Enthalten sind `GET /status`, `POST /upload` (mit `HEAD`-Offset und
+`?offset=` fortsetzbar), `DELETE /upload`, `GET /files` (Name, Größe, Quote),
+`GET /diagnostics` (PIN; freier Platz, Schreib-/Löschtest, PIN-Datei,
+AppInstUtil und BGFT-Laden),
+eine optionale Quote aus `/data/ps4upload/config.txt`, eine PKG-Prüfung vor
+dem Ablegen und ein Diagnose-Log unter `/data/ps4upload/payload.log`. Das ist der Anfang
+des Wegs, PS5Uploads Client/Engine gegen die PS4 sprechen zu lassen – kein
+fertiger Clone: BGFT-Installation und AVA1 fehlen.
+
+```bash
+python tools/ps4payload.py fetch-sdk   # ps4-payload-sdk v0.9 (~6 MB)
+python tools/ps4payload.py build       # -> dist/PS4Upload-Payload-0.6.2.elf
+python tools/ps4payload.py verify dist/PS4Upload-Payload-0.6.2.elf
+python tools/ps4payload.py link-check  # P1-Spike: install.h gegen BGFT linken
+
+python tools/ps4payload-client.py status --host <PS4-IP>
+python tools/ps4payload-client.py diagnostics --host <PS4-IP> --pin 4711
+python tools/ps4payload-client.py upload spiel.pkg --host <PS4-IP> --pin 4711 --resume
+```
+
+Laden über GoldHEN-BinLoader (`9090`, z. B. mit `ps4manage.py`), danach
+`http://<PS4-IP>:9180/status`. Details und Grenzen:
+[`payload/ps4/README.md`](payload/ps4/README.md).
 
 ## PS4-PKG bauen und verifizieren
 
@@ -264,9 +336,10 @@ zeigt ihre Oberflaeche daher selbst an, statt den Browser zu benutzen.
 Die Seite nimmt inzwischen auch eine PKG an: Der Datei-Body wird nach
 `/data/ps4upload/` gestreamt, vor der Installation geprueft (Magic, Groesse,
 `param.sfo`) und ueber BGFT installiert. Vor dem Upload muss die vierstellige
-PIN eingegeben werden, die auf dem Fernseher steht; falsche Versuche erscheinen
-im INSTALL-Reiter und im Kernel-Log, nach fuenf Fehlversuchen ist der Upload
-eine Minute gesperrt. Eine Update-Karte auf der Seite prueft den GitHub-Release,
+PIN eingegeben werden, die auf dem Fernseher steht und im Header
+`X-Upload-Pin` übertragen wird; falsche Versuche erscheinen im INSTALL-Reiter
+und im Kernel-Log, nach fuenf Fehlversuchen ist nur dieser Client eine Minute
+gesperrt. Eine Update-Karte auf der Seite prueft den GitHub-Release,
 vergleicht ihn mit der installierten Version und schickt die neue PKG ueber
 denselben Upload-Weg; gleiche oder aeltere Versionen werden serverseitig
 abgewiesen und erst nach Bestaetigung mit `force=1` installiert. Der INSTALL-Reiter auf dem Fernseher

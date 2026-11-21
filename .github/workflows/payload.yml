@@ -1,0 +1,244 @@
+name: PS4-Payload
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: payload-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hosttests:
+    name: Hosttests (Kern, PKG, Installation)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Quellen auschecken
+        uses: actions/checkout@v7
+
+      - name: Python einrichten
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: ziglang installieren
+        run: python -m pip install --disable-pip-version-check "ziglang==0.17.1"
+
+      - name: Hosttests ausfuehren
+        run: python ps4port/core/tools/hostcheck.py
+
+  sanitizers:
+    name: Hosttests unter ASan/UBSan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - name: Quellen auschecken
+        uses: actions/checkout@v7
+
+      - name: clang bereitstellen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+          clang --version
+
+      # Dieselben drei Programme wie ps4port/core/tools/hostcheck.py, hier mit
+      # clang und Sanitizern; Flags und Include-Pfade bleiben identisch.
+      - name: Kern (hostcheck.c) mit ASan/UBSan
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/san
+          clang -std=c11 -Wall -Wextra -Werror -g -O1 \
+            -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+            -fno-omit-frame-pointer \
+            -I ps4port/core/include -I ps4app \
+            ps4port/core/src/*.c ps4port/core/tests/hostcheck.c \
+            -o build/san/hostcheck
+          build/san/hostcheck
+
+      - name: PKG-Pruefung (pkg_hostcheck.cpp) mit ASan/UBSan
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang++ -std=c++17 -Wall -Wextra -Werror -g -O1 \
+            -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+            -fno-omit-frame-pointer \
+            -I ps4app payload/ps4/tests/pkg_hostcheck.cpp \
+            -o build/san/pkgcheck
+          mkdir -p build/san/pkgwork
+          build/san/pkgcheck build/san/pkgwork
+
+      - name: Installation (install_hostcheck.cpp) mit ASan/UBSan
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang++ -std=c++17 -Wall -Wextra -Werror -g -O1 \
+            -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+            -fno-omit-frame-pointer \
+            -I ps4app payload/ps4/tests/install_hostcheck.cpp \
+            -o build/san/installcheck
+          mkdir -p build/san/installwork
+          cd build/san/installwork
+          ../installcheck
+
+  client:
+    name: Payload-Client gegen Mock
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Quellen auschecken
+        uses: actions/checkout@v7
+
+      - name: Python einrichten
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Client-Test ausfuehren
+        run: python tools/tests/check_client.py
+
+  fuzz:
+    name: Parser-Fuzzing (Anfragekopf und PKG)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Quellen auschecken
+        uses: actions/checkout@v7
+
+      - name: clang bereitstellen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+          clang --version
+
+      - name: Kernobjekte mit Sanitizern uebersetzen
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/fuzz
+          for src in ps4port/core/src/*.c; do
+            name="$(basename "${src%.c}")"
+            clang -std=c11 -g -O1 \
+              -fsanitize=fuzzer-no-link,address,undefined \
+              -I ps4port/core/include -c "$src" -o "build/fuzz/$name.o"
+          done
+
+      - name: Startfaelle erzeugen
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang++ -std=c++17 -O1 -I ps4app payload/ps4/tests/pkg_hostcheck.cpp \
+            -o build/fuzz/pkgseed
+          mkdir -p build/fuzz/corpus
+          build/fuzz/pkgseed --seed build/fuzz/corpus
+          printf 'POST /upload?name=spiel.pkg&offset=1024 HTTP/1.1\r\nContent-Length: 2048\r\nX-Upload-Pin: 4711\r\n\r\n' \
+            > build/fuzz/corpus/http.seed
+          printf 'GET /diagnostics HTTP/1.1\r\nX-Upload-Pin: 0000\r\n\r\n' \
+            > build/fuzz/corpus/diag.seed
+
+      - name: Harness bauen
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang++ -std=c++17 -g -O1 \
+            -fsanitize=fuzzer,address,undefined \
+            -I ps4port/core/include -I ps4app \
+            ps4port/core/tests/fuzz_targets.cpp build/fuzz/*.o \
+            -o build/fuzz/fuzz_targets
+
+      - name: 60 Sekunden fuzzen
+        shell: bash
+        run: |
+          set -euo pipefail
+          build/fuzz/fuzz_targets \
+            -max_total_time=60 -timeout=10 -rss_limit_mb=2048 \
+            -max_len=16384 -print_final_stats=1 \
+            build/fuzz/corpus
+
+  payload:
+    name: Payload-ELF bauen
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Quellen auschecken
+        uses: actions/checkout@v7
+
+      - name: Python einrichten
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: ziglang installieren
+        run: python -m pip install --disable-pip-version-check "ziglang==0.17.1"
+
+      - name: ps4-payload-sdk cachen
+        uses: actions/cache@v6
+        with:
+          path: |
+            ps4sdk/ps4-payload-sdk
+            .tmp/ps4-payload-sdk.zip
+          key: ps4-payload-sdk-v0.9
+
+      - name: SDK laden
+        run: python tools/ps4payload.py fetch-sdk
+
+      - name: ELF bauen und pruefen
+        run: python tools/ps4payload.py build --out .tmp/build1
+
+      - name: Reproduzierbarkeit pruefen
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/ps4payload.py build --out .tmp/build2 > /dev/null
+          first="$(ls .tmp/build1/PS4Upload-Payload-*.elf)"
+          second="$(ls .tmp/build2/PS4Upload-Payload-*.elf)"
+          sha256sum "$first" "$second"
+          if ! cmp -s "$first" "$second"; then
+            echo "::error::Zweiter Payload-Build ist nicht byte-identisch"
+            exit 1
+          fi
+
+      - name: ELF als Artefakt sichern
+        uses: actions/upload-artifact@v7
+        with:
+          name: ps4upload-payload
+          path: .tmp/build1/PS4Upload-Payload-*.elf
+          if-no-files-found: error
+
+  link-check:
+    name: install.h gegen BGFT/AppInstUtil linken
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Quellen auschecken
+        uses: actions/checkout@v7
+
+      - name: Python einrichten
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: ziglang installieren
+        run: python -m pip install --disable-pip-version-check "ziglang==0.17.1"
+
+      - name: OpenOrbis-Toolchain cachen
+        uses: actions/cache@v6
+        with:
+          path: |
+            ps4sdk
+            .tmp/toolchain-llvm-18.tar.gz
+          key: orbis-toolchain-0.5.4-3c7cd5bb
+
+      - name: Toolchain laden
+        run: python tools/ps4pkg.py fetch-sdk
+
+      - name: Link-Check ausfuehren
+        run: python tools/ps4payload.py link-check
