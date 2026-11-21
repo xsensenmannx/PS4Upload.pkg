@@ -235,10 +235,16 @@ jobs:
           path: |
             ps4sdk
             .tmp/toolchain-llvm-18.tar.gz
+            .tmp/ps4-payload-sdk.zip
           key: orbis-toolchain-0.5.4-3c7cd5bb
 
       - name: Toolchain laden
         run: python tools/ps4pkg.py fetch-sdk
+
+      # link-check baut mit beiden SDKs: OpenOrbis fuer install.h, ps4-payload-sdk
+      # fuer die ELF-Pruefung.
+      - name: Payload-SDK laden
+        run: python tools/ps4payload.py fetch-sdk
 
       - name: Link-Check ausfuehren
         run: python tools/ps4payload.py link-check

@@ -13,6 +13,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 #include <unistd.h>
 #include <errno.h>
 #include <netinet/in.h>
@@ -21,6 +22,7 @@
 #include <sys/time.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 
 #include <orbis/libkernel.h>
 #include <orbis/Pad.h>
@@ -31,6 +33,7 @@
 #include "diag.h"
 #include "pin.h"
 #include "pkg.h"
+#include "upload.h"
 #include "install.h"
 #include "version.h"
 #include "ui.h"
@@ -88,6 +91,7 @@ static int g_pad = -1;
 static unsigned int g_buttons = 0;
 static int g_user_id = -1;
 static PinState g_pin;
+static PinClientState g_pin_clients[PIN_CLIENT_CAPACITY];
 
 /*
  * Ein Client gleichzeitig. Der Body wird in Stuecken gelesen und sofort
@@ -106,8 +110,9 @@ static struct
     unsigned long long length;
     unsigned long long received;
     unsigned long long started_ms;
+    unsigned long long last_io_ms;
     bool force;
-} g_conn = { -1, 0, { 0 }, 0, 0, { 0 }, { 0 }, 0, 0, 0, false };
+} g_conn = { -1, 0, { 0 }, 0, 0, { 0 }, { 0 }, 0, 0, 0, 0, false };
 
 static UiInstallView g_install_view;
 
@@ -316,7 +321,8 @@ static void send_page(int fd, const char *client_ip)
         "if(!/^[0-9]{4}$/.test(pin.value)){out.textContent='Bitte die 4-stellige PIN vom Fernseher eingeben.';return;}"
         "if(!file){out.textContent='Bitte eine PKG waehlen.';return;}"
         "var xhr=new XMLHttpRequest();xhr.open('POST','/upload?name='+encodeURIComponent(file.name)"
-        "+'&pin='+encodeURIComponent(pin.value)+(force?'&force=1':''));"
+        "+(force?'&force=1':''));"
+        "xhr.setRequestHeader('X-Upload-Pin',pin.value);"
         "go.disabled=true;"
         "xhr.upload.onprogress=function(e){if(e.lengthComputable){"
         "bar.style.width=(e.loaded/e.total*100)+'%';"
@@ -324,6 +330,7 @@ static void send_page(int fd, const char *client_ip)
         "xhr.onload=function(){go.disabled=false;"
         "if(xhr.status===200){out.textContent='Empfangen. Installation laeuft.';}"
         "else if(xhr.status===403){out.textContent='PIN falsch oder gesperrt - Code steht am Fernseher.';pin.value='';}"
+        "else if(xhr.status===423){out.textContent='Installation laeuft noch - bitte warten.';}"
         "else if(xhr.status===409){var msg='Gleiche oder aeltere Version.';"
         "try{msg=JSON.parse(xhr.responseText).error||msg;}catch(e){}"
         "out.textContent=msg;if(confirm(msg+'\\n\\nTrotzdem installieren?')){sendUpload(true);}}"
@@ -542,6 +549,9 @@ static void conn_close(void)
     g_conn.header[0] = 0;
     g_conn.length = 0;
     g_conn.received = 0;
+    g_conn.started_ms = 0;
+    g_conn.last_io_ms = 0;
+    g_conn.path[0] = 0;
     g_conn.force = false;
 }
 
@@ -609,7 +619,13 @@ static unsigned long long header_number(const char *header, const char *name)
 
     while (*value >= '0' && *value <= '9')
     {
-        number = number * 10ull + (unsigned long long)(*value - '0');
+        unsigned long long digit = (unsigned long long)(*value - '0');
+
+        if (number > (ULLONG_MAX - digit) / 10ull)
+        {
+            return ULLONG_MAX;
+        }
+        number = number * 10ull + digit;
         value++;
     }
 
@@ -645,7 +661,7 @@ static void upload_name(const char *target, char *out, int capacity)
     {
         const char *value = query + 6;
 
-        while (*value != 0 && *value != ' ' && used < capacity - 1)
+        while (*value != 0 && *value != ' ' && *value != '&' && used < capacity - 1)
         {
             char decoded = *value++;
 
@@ -754,58 +770,57 @@ static void send_result(int fd, int code, const char *reason, bool ok, const Pkg
 }
 
 /*
- * Prueft die PIN aus ?pin= serverseitig. Fehlversuche werden gezaehlt, nach
- * PIN_MAX_FAILURES gesperrt und im Kernel-Log sowie im INSTALL-Reiter gemeldet.
- * Die PIN selbst steht nur auf dem Fernseher.
+ * Prueft die PIN aus dem Header X-Upload-Pin serverseitig. Fehlversuche
+ * werden pro Client-IP gezaehlt und gesperrt; die PIN selbst steht nur auf
+ * dem Fernseher.
  */
-static bool pin_allow_upload(const char *target)
+static bool pin_allow_upload(const char *header, const char *client_ip)
 {
-    const char *query = strstr(target, "pin=");
+    const char *value = header_value(header, PIN_HEADER_NAME);
+    PinClientState *client = pin_client_state(g_pin_clients, PIN_CLIENT_CAPACITY, client_ip);
     char given[PIN_DIGITS + 1];
     char note[80];
     unsigned long long now = uptime_ms();
-    int used = 0;
     int index;
+    bool parsed;
 
-    if (pin_locked(g_pin, now))
+    if (client == 0)
     {
-        diag_text("Upload abgewiesen: PIN gesperrt");
+        diag_text("PIN-Clienttabelle voll - Upload abgewiesen");
+        install_mark_failed_note(0, "PIN-CLIENTTABELLE VOLL");
+        return false;
+    }
+
+    if (pin_locked(*client, now))
+    {
+        diag_text("Upload abgewiesen: PIN fuer diesen Client gesperrt");
         install_mark_failed_note(0, "PIN GESPERRT - KURZ WARTEN");
         return false;
     }
 
-    if (query != 0)
+    parsed = pin_parse_value(value, given, (int)sizeof(given));
+    if (parsed && pin_equal(g_pin.value, given))
     {
-        query += 4;
-        while (*query >= '0' && *query <= '9' && used < PIN_DIGITS)
-        {
-            given[used++] = *query++;
-        }
-    }
-    given[used] = 0;
-
-    if (pin_equal(g_pin.value, given))
-    {
-        pin_succeeded(g_pin);
+        pin_succeeded(*client);
         return true;
     }
 
-    pin_fail(g_pin, now);
+    pin_fail(*client, now);
 
     index = 0;
     index = diag_append(note, sizeof(note), index, "Upload abgewiesen: falsche PIN (Versuch ");
-    index = diag_uint(note, sizeof(note), index, g_pin.failures);
+    index = diag_uint(note, sizeof(note), index, client->failures);
     diag_append(note, sizeof(note), index, ")");
     diag_text(note);
 
-    if (pin_locked(g_pin, now))
+    if (pin_locked(*client, now))
     {
-        diag_text("Zu viele Fehlversuche - Upload 60 s gesperrt");
+        diag_text("Zu viele Fehlversuche - Upload 60 s fuer diesen Client gesperrt");
     }
 
     index = 0;
     index = ui_append_text(note, sizeof(note), index, "PIN FALSCH - VERSUCH ");
-    index = ui_append_uint(note, sizeof(note), index, g_pin.failures);
+    index = ui_append_uint(note, sizeof(note), index, client->failures);
     install_mark_failed_note(0, note);
 
     return false;
@@ -815,12 +830,27 @@ static void conn_finish_upload(void)
 {
     PkgInfo info;
     bool ok;
+    bool closed_ok = true;
     int fd = g_conn.fd;
 
     if (g_conn.file != 0)
     {
-        fclose(g_conn.file);
+        if (fclose(g_conn.file) != 0)
+        {
+            closed_ok = false;
+        }
         g_conn.file = 0;
+    }
+
+    if (!closed_ok)
+    {
+        remove(g_conn.path);
+        install_mark_failed_note(-5, "SPEICHER VOLL ODER SCHREIBFEHLER");
+        send_result(fd, 507, "Insufficient Storage", false, 0,
+                    "Schreibfehler oder Speicher voll");
+        log_add(g_client_ip, "UPLOAD FEHLER");
+        conn_close();
+        return;
     }
 
     install_mark_check();
@@ -828,6 +858,7 @@ static void conn_finish_upload(void)
     ok = pkg_probe(g_conn.path, &info);
     if (!ok)
     {
+        remove(g_conn.path);
         install_mark_failed_note(-1, info.error);
         send_result(fd, 400, "Bad Request", false, 0, info.error);
         log_add(g_client_ip, "PKG UNGUELTIG");
@@ -838,7 +869,21 @@ static void conn_finish_upload(void)
     {
         int installed = pkg_version_value(APP_VER);
         int package = pkg_version_value(info.app_ver);
-        bool not_newer = installed >= 0 && package >= 0 && package <= installed;
+        bool not_newer;
+
+        /* Der Parser lehnt das schon ab; hier bleibt die 409-Sperre auch bei
+         * einem spaeteren Parserfehler fail-closed. */
+        if (installed < 0 || package < 0)
+        {
+            remove(g_conn.path);
+            install_mark_failed_note(-8, "APP_VER UNGUELTIG");
+            send_result(fd, 400, "Bad Request", false, 0, "APP_VER ungueltig");
+            log_add(g_client_ip, "PKG VERSION UNGUELTIG");
+            conn_close();
+            return;
+        }
+
+        not_newer = package <= installed;
 
         if (not_newer && !g_conn.force)
         {
@@ -923,13 +968,54 @@ static void conn_write_body(const char *data, int bytes)
     }
 }
 
+static void conn_abort_upload(const char *note)
+{
+    if (g_conn.file != 0)
+    {
+        fclose(g_conn.file);
+        g_conn.file = 0;
+    }
+    if (g_conn.path[0] != 0)
+    {
+        remove(g_conn.path);
+        g_conn.path[0] = 0;
+    }
+
+    install_mark_failed_note(-6, note);
+    log_add(g_client_ip, note);
+    conn_close();
+}
+
+static unsigned long long upload_free_bytes(void)
+{
+    struct statvfs fs;
+    unsigned long long block;
+
+    if (statvfs(UPLOAD_DIR, &fs) != 0)
+    {
+        diag_code("statvfs", errno);
+        return 0;
+    }
+
+    block = fs.f_frsize != 0 ? (unsigned long long)fs.f_frsize
+                             : (unsigned long long)fs.f_bsize;
+    return (unsigned long long)fs.f_bavail * block;
+}
+
 static bool conn_begin_upload(const char *target, unsigned long long content_length)
 {
     int used = 0;
 
     g_conn.force = strstr(target, "force=1") != 0;
 
-    if (!pin_allow_upload(target))
+    if (install_busy())
+    {
+        send_result(g_conn.fd, 423, "Locked", false, 0, "Installation laeuft noch");
+        log_add(g_client_ip, "UPLOAD BLOCKIERT - INSTALLATION LAEUFT");
+        return false;
+    }
+
+    if (!pin_allow_upload(g_conn.header, g_client_ip))
     {
         send_result(g_conn.fd, 403, "Forbidden", false, 0, "PIN falsch oder gesperrt");
         log_add(g_client_ip, "PIN ABGEWIESEN");
@@ -941,6 +1027,22 @@ static bool conn_begin_upload(const char *target, unsigned long long content_len
         send_status(g_conn.fd, 411, "Length Required", 0);
         install_mark_failed_note(-3, "KEINE LAENGE ANGEGEBEN");
         return false;
+    }
+
+    mkdir(UPLOAD_DIR, 0777);
+    {
+        unsigned long long free_bytes = upload_free_bytes();
+
+        if (!upload_bgft_space_ok(content_length, free_bytes, UPLOAD_SPACE_RESERVE_BYTES))
+        {
+            send_result(g_conn.fd, 507, "Insufficient Storage", false, 0,
+                        "Zu wenig freier Speicher");
+            install_mark_failed_note(-7, "ZU WENIG SPEICHER");
+            diag_size("Freier Speicher", (size_t)free_bytes);
+            diag_size("Upload-Groesse", (size_t)content_length);
+            log_add(g_client_ip, "ZU WENIG SPEICHER");
+            return false;
+        }
     }
 
     upload_name(target, g_conn.name, sizeof(g_conn.name));
@@ -1054,15 +1156,16 @@ static void conn_handle_request(void)
         return;
     }
 
-    if (expect != 0 && header_prefix(expect, "100-continue"))
-    {
-        write_all(g_conn.fd, "HTTP/1.1 100 Continue\r\n\r\n", 25);
-    }
-
     if (!conn_begin_upload(target, content_length))
     {
         conn_close();
         return;
+    }
+
+    /* Erst nach Sperre, PIN und Speicherpruefung weitersenden lassen. */
+    if (expect != 0 && header_prefix(expect, "100-continue"))
+    {
+        write_all(g_conn.fd, "HTTP/1.1 100 Continue\r\n\r\n", 25);
     }
 
     if (body_bytes > 0)
@@ -1111,6 +1214,7 @@ static void server_poll(void)
         g_conn.header_len = 0;
         g_conn.header[0] = 0;
         g_conn.started_ms = now;
+        g_conn.last_io_ms = now;
         return;
     }
 
@@ -1151,6 +1255,7 @@ static void server_poll(void)
 
         g_conn.header_len += received;
         g_conn.header[g_conn.header_len] = 0;
+        g_conn.last_io_ms = now;
 
         if (strstr(g_conn.header, "\r\n\r\n") != 0)
         {
@@ -1169,6 +1274,12 @@ static void server_poll(void)
             struct timeval timeout;
             int received;
 
+            if (upload_idle_expired(now, g_conn.last_io_ms, UPLOAD_IDLE_TIMEOUT_MS))
+            {
+                conn_abort_upload("UPLOAD TIMEOUT");
+                break;
+            }
+
             FD_ZERO(&read_set);
             FD_SET(g_conn.fd, &read_set);
             timeout.tv_sec = 0;
@@ -1182,18 +1293,11 @@ static void server_poll(void)
             received = (int)read(g_conn.fd, buffer, sizeof(buffer));
             if (received <= 0)
             {
-                if (g_conn.file != 0)
-                {
-                    fclose(g_conn.file);
-                    g_conn.file = 0;
-                }
-                remove(g_conn.path);
-                install_mark_failed_note(-2, "UPLOAD ABGEBROCHEN");
-                log_add(g_client_ip, "UPLOAD ABBRUCH");
-                conn_close();
+                conn_abort_upload("UPLOAD ABGEBROCHEN");
                 break;
             }
 
+            g_conn.last_io_ms = uptime_ms();
             conn_write_body(buffer, received);
         }
     }
