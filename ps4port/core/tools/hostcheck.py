@@ -97,7 +97,9 @@ def run_pkg_check(zig: str, build_dir: Path) -> int:
         return compiled.returncode
 
     # Frisches Arbeitsverzeichnis, damit kein Rest eines alten Laufs zaehlt.
-    work_dir = build_dir / "pkgcheck"
+    # Eigenes Arbeitsverzeichnis mit Suffix: unter Linux heisst das Binary
+    # "pkgcheck" ohne Endung und wuerde sonst mit dem Ordner kollidieren.
+    work_dir = build_dir / "pkgcheck-work"
     shutil.rmtree(work_dir, ignore_errors=True)
     work_dir.mkdir(parents=True)
     try:
@@ -127,7 +129,7 @@ def run_install_check(zig: str, build_dir: Path) -> int:
     if compiled.returncode != 0:
         return compiled.returncode
 
-    work_dir = build_dir / "installcheck"
+    work_dir = build_dir / "installcheck-work"
     shutil.rmtree(work_dir, ignore_errors=True)
     work_dir.mkdir(parents=True)
     try:
